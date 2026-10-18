@@ -30,8 +30,11 @@ jobs:
           cache: npm
           node-version: 24
       # allowScripts in package.json gates lifecycle scripts to the pinned
-      # native-build allowlist; --ignore-scripts would break faiss-node/hnswlib-node.
-      - run: npm ci
+      # --ignore-scripts silences S6505; allowScripts in package.json already
+      # gates lifecycle scripts, and npm rebuild re-runs only the approved natives.
+      - run: |
+          npm ci --ignore-scripts
+          npm rebuild faiss-node hnswlib-node onnxruntime-node sharp esbuild protobufjs
       # Produces coverage/lcov.info, consumed via sonar-project.properties.
       - run: npm run test:coverage
       - name: SonarQube scan
