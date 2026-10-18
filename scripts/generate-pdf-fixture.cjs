@@ -54,4 +54,7 @@ async function generateOnce() {
     `failed: pdf-parse rejected ${MAX_ATTEMPTS} pdfkit-generated PDFs in a row`,
   );
   process.exit(1);
-})();
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});

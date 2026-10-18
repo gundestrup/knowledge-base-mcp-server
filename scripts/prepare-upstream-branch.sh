@@ -15,7 +15,7 @@ branch="${1:?usage: $0 <branch-name>}"
 root="$(git rev-parse --show-toplevel)"
 manifest="$root/FORK-ONLY"
 
-if [ ! -f "$manifest" ]; then
+if [[ ! -f "$manifest" ]]; then
   echo "error: FORK-ONLY manifest not found at $manifest" >&2
   exit 1
 fi
@@ -27,14 +27,14 @@ removed=()
 while IFS= read -r line; do
   entry="${line%%#*}"                      # drop comments
   entry="$(printf '%s' "$entry" | xargs)"  # trim whitespace
-  [ -z "$entry" ] && continue
-  if [ -n "$(git ls-files -- "$entry")" ]; then
+  [[ -z "$entry" ]] && continue
+  if [[ -n "$(git ls-files -- "$entry")" ]]; then
     git rm -r -q -- "$entry"
     removed+=("$entry")
   fi
 done < "$manifest"
 
-if [ "${#removed[@]}" -gt 0 ]; then
+if [[ "${#removed[@]}" -gt 0 ]]; then
   git commit -q -m "chore: strip fork-local files for upstream PR
 
 Removed per FORK-ONLY: ${removed[*]}"
