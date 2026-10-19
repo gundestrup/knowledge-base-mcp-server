@@ -144,6 +144,12 @@
     "@langchain/community": {
       "@huggingface/transformers": "^4.3.1",
       "html-to-text": "^10.0.1"
+    },
+    "@browserbasehq/stagehand": {
+      "zod": "^4"
+    },
+    "openai": {
+      "zod": "^4"
     }
   },
   "allowScripts": {
