@@ -61,6 +61,12 @@ export function parseFrontmatter(content: string): ParsedFrontmatter {
   const yamlRaw = searchSlice.slice(0, yamlEnd);
   const body = normalizedContent.slice(openEnd + fenceEnd);
 
+  // js-yaml 5 throws on empty input where 4.x returned undefined — treat an
+  // empty frontmatter block as a valid empty parse instead.
+  if (yamlRaw.trim() === '') {
+    return { tags: [], body, frontmatter: {} };
+  }
+
   let parsed: unknown;
   try {
     parsed = yaml.load(yamlRaw, { schema: yaml.FAILSAFE_SCHEMA });
@@ -132,10 +138,16 @@ export function parseFrontmatterStrict(content: string): StrictParsedFrontmatter
   const fenceEnd = closeMatch.index + closeMatch[0].length;
   const yamlRaw = searchSlice.slice(0, yamlEnd);
   let parsed: unknown;
-  try {
-    parsed = yaml.load(yamlRaw, { schema: yaml.FAILSAFE_SCHEMA });
-  } catch (error) {
-    throw new Error(`malformed frontmatter: ${(error as Error).message}`);
+  // js-yaml 5 throws on empty input where 4.x returned undefined — treat an
+  // empty frontmatter block as an empty mapping.
+  if (yamlRaw.trim() === '') {
+    parsed = {};
+  } else {
+    try {
+      parsed = yaml.load(yamlRaw, { schema: yaml.FAILSAFE_SCHEMA });
+    } catch (error) {
+      throw new Error(`malformed frontmatter: ${(error as Error).message}`);
+    }
   }
 
   if (parsed === undefined) parsed = {};
