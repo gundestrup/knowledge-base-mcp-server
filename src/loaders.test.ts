@@ -54,9 +54,21 @@ const SAMPLE_PDF_FIXTURE = path.join(
 // the only logic in `loadPdf` worth unit-testing in isolation.
 const pdfParseFnMock = jest.fn();
 
-jest.mock('pdf-parse/lib/pdf-parse.js', () => ({
+// pdf-parse@2 exports a `PDFParse` class: the loader constructs it with
+// `{data: Uint8Array}` and calls `getText()`. The mock forwards the bytes to
+// `pdfParseFnMock` so the existing call/argument assertions stay valid.
+jest.mock('pdf-parse', () => ({
   __esModule: true,
-  default: (buf: Buffer) => pdfParseFnMock(buf),
+  PDFParse: class {
+    private readonly data: Uint8Array;
+    constructor(options: { data: Uint8Array }) {
+      this.data = options.data;
+    }
+    getText(): Promise<{ text: string }> {
+      return pdfParseFnMock(this.data);
+    }
+    async destroy(): Promise<void> {}
+  },
 }));
 
 describe('LOADERS registry', () => {
