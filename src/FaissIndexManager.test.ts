@@ -3854,11 +3854,15 @@ describe('FaissIndexManager ingest — PDF + HTML loaders (issue #46)', () => {
   // path lets us assert that .pdf files are routed through the PDF loader,
   // that the extracted text reaches the splitter, and that PDF chunks land
   // with the right metadata — without booting pdfjs.
-  jest.mock('pdf-parse/lib/pdf-parse.js', () => ({
+  jest.mock('pdf-parse', () => ({
     __esModule: true,
-    default: async (_buf: Buffer) => ({
-      text: 'Mock PDF body extracted by pdf-parse stub.',
-    }),
+    PDFParse: class {
+      constructor(_options: { data: Uint8Array }) {}
+      async getText() {
+        return { text: 'Mock PDF body extracted by pdf-parse stub.' };
+      }
+      async destroy(): Promise<void> {}
+    },
   }));
 
   const originalEnv = {
