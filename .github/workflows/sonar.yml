@@ -33,7 +33,11 @@ jobs:
       # gates lifecycle scripts, and npm rebuild re-runs only the approved natives.
       - run: |
           npm ci --ignore-scripts
-          npm rebuild faiss-node hnswlib-node onnxruntime-node sharp esbuild protobufjs
+          npm rebuild faiss-node hnswlib-node onnxruntime-node sharp esbuild protobufjs || {
+            echo "native rebuild failed — retrying after 10s"
+            sleep 10
+            npm rebuild faiss-node hnswlib-node onnxruntime-node sharp esbuild protobufjs
+          }
       # --help/smoke suites spawn build/cli.js — must exist before coverage runs.
       - run: npm run build
       # Produces coverage/lcov.info, consumed via sonar-project.properties.
