@@ -61,17 +61,21 @@ export function parseFrontmatter(content: string): ParsedFrontmatter {
   const yamlRaw = searchSlice.slice(0, yamlEnd);
   const body = normalizedContent.slice(openEnd + fenceEnd);
 
-  // js-yaml 5 throws on empty input where 4.x returned undefined — treat an
-  // empty frontmatter block as a valid empty parse instead.
-  if (yamlRaw.trim() === '') {
-    return { tags: [], body, frontmatter: {} };
-  }
-
+  const hasYamlContent = yamlRaw.split(/\r\n?|\n/).some((line) => {
+    const trimmed = line.trim();
+    return trimmed !== '' && !trimmed.startsWith('#');
+  });
   let parsed: unknown;
-  try {
-    parsed = yaml.load(yamlRaw, { schema: yaml.FAILSAFE_SCHEMA });
-  } catch {
-    return { tags: [], body: content, frontmatter: {} };
+  if (!hasYamlContent) {
+    // js-yaml 5 rejects empty/comment-only documents. Lenient ingestion must
+    // still strip their fences; strict mutation parsing keeps its own policy.
+    parsed = undefined;
+  } else {
+    try {
+      parsed = yaml.load(yamlRaw, { schema: yaml.FAILSAFE_SCHEMA });
+    } catch {
+      return { tags: [], body: content, frontmatter: {} };
+    }
   }
 
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
@@ -138,10 +142,11 @@ export function parseFrontmatterStrict(content: string): StrictParsedFrontmatter
   const fenceEnd = closeMatch.index + closeMatch[0].length;
   const yamlRaw = searchSlice.slice(0, yamlEnd);
   let parsed: unknown;
-  // js-yaml 5 throws on empty input where 4.x returned undefined — treat an
-  // empty frontmatter block as an empty mapping.
   if (yamlRaw.trim() === '') {
-    parsed = {};
+    // js-yaml 5 throws on an empty document where js-yaml 4 returned
+    // undefined; an empty frontmatter block is a valid empty mapping, not
+    // malformed. Normalize to undefined so the guard below coerces it to {}.
+    parsed = undefined;
   } else {
     try {
       parsed = yaml.load(yamlRaw, { schema: yaml.FAILSAFE_SCHEMA });
