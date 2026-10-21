@@ -133,8 +133,8 @@ const generalization = computeGeneralizationReport(
   modes,
 );
 
-// resolving git via PATH is intentional.
-const gitSha = execFileSync('git', ['rev-parse', '--short', 'HEAD'], { cwd: repoRoot, encoding: 'utf-8' }).trim(); // NOSONAR javascript:S4036
+// NOSONAR javascript:S4036 — resolving git via PATH is intentional.
+const gitSha = execFileSync('git', ['rev-parse', '--short', 'HEAD'], { cwd: repoRoot, encoding: 'utf-8' }).trim();
 
 const report = {
   schema_version: MATRIX_SCHEMA_VERSION,
