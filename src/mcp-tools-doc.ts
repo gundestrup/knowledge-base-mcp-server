@@ -34,6 +34,7 @@ interface ZodCheckDef {
 
 interface ZodDefView {
   type?: string;
+  format?: string;
   innerType?: unknown;
   element?: unknown;
   entries?: Record<string, unknown>;
@@ -90,7 +91,8 @@ function typeInfo(node: unknown): { type: string; constraints: string[] } {
       return { type: 'string', constraints };
     }
     case 'number': {
-      let isInt = false;
+      // z.int() bakes the format onto the def; `.int()` appends a check.
+      let isInt = def.format === 'safeint' || def.format === 'int32' || def.format === 'uint32';
       const constraints: string[] = [];
       for (const check of checkDefs(def)) {
         if (check.check === 'number_format' && check.format === 'safeint') isInt = true;
