@@ -1213,7 +1213,7 @@ Rebuild FAISS indexes (RFC 017 — requires --with-context).
 kb reindex — rebuild FAISS indexes (RFC 017)
 
 Usage:
-  kb reindex --with-context [--kb=<name>...] [--force]
+  kb reindex --with-context [--kb=<name>...] [--model=<id>] [--force]
   kb reindex status [--kb=<name>...] [--format=md|json]
 
 The `--with-context` flag is REQUIRED in this milestone (M0b). It runs
@@ -1280,6 +1280,15 @@ Options:
                         (unknown name -> exit 2). Repeat for multiple KBs.
                         Default: every registered KB. Status: limit the
                         report to this KB.
+  --model=<id>          Reindex this registered model_id instead of the
+                        active one. Default: the active model resolved from
+                        `$FAISS_INDEX_PATH/active.txt` (same precedence as
+                        `kb search`) — NOT the EMBEDDING_PROVIDER/OLLAMA_MODEL
+                        env vars. This makes a stale `OLLAMA_MODEL` export
+                        inert: it can no longer silently create an empty
+                        parallel FAISS store or purge the shared `.index`
+                        content-hash caches (issue #1043). An unregistered or
+                        malformed id exits 2.
   --force               Bypass the LRA cron window guard AND the
                         self-runtime-budget guard. Required to start
                         a reindex inside 06:00-10:30 UTC or when the
@@ -1293,7 +1302,8 @@ Options:
 Exit codes:
   0   success — index swapped / status reported
   1   updateIndex reported partial or failed status
-  2   argv / env error (e.g. --kb=<missing>, missing --with-context)
+  2   argv / env error (e.g. --kb=<missing>, --model=<unregistered>,
+      unresolvable active model, missing --with-context)
   3   guard blocked the run (inside or crossing the LRA window)
   4   another reindex is already running on the same model
   5   disk-space preflight failed (estimated write exceeds free space
@@ -1703,9 +1713,10 @@ The daemon accepts read-only search/list/stats requests and exits after the
 idle timeout.
 
 `kb serve status` reports whether a daemon is reachable at the configured
-URL along with its PID, idle timeout, supported commands, and uptime. It
-never starts or stops a daemon. When `kb search --daemon` cannot reach a
-daemon it prints a one-line notice to stderr and runs the search directly.
+URL along with its PID, idle timeout, supported commands, uptime, and the
+build (version + commit) it is serving. It never starts or stops a daemon.
+When `kb search --daemon` cannot reach a daemon it prints a one-line notice
+to stderr and runs the search directly.
 
 Options:
   --host=<host>             Loopback host to bind (default: 127.0.0.1).
