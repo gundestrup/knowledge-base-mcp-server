@@ -102,7 +102,7 @@
     "js-yaml": "^5.4.3",
     "langchain": "^1.5.16",
     "mdast-util-from-markdown": "^2.0.3",
-    "minimatch": "^10.2.5",
+    "minimatch": "^11.0.1",
     "pdf-parse": "^2.4.5",
     "pickleparser": "^0.2.1",
     "proper-lockfile": "^4.1.2",
