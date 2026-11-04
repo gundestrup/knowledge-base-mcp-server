@@ -26,8 +26,28 @@ die() { echo "install: error: $*" >&2; exit 1; }
 info() { echo "install: $*"; }
 
 # --- preflight 1: SwiftBar -------------------------------------------------
+# Pass --install-swiftbar (or KB_INSTALL_SWIFTBAR=1) to install it via
+# Homebrew automatically instead of just outlining the suggestion.
 if [[ ! -d /Applications/SwiftBar.app && ! -d "$HOME/Applications/SwiftBar.app" ]]; then
-  die "SwiftBar not found — install it first: brew install --cask swiftbar"
+  if [[ "${1:-}" == "--install-swiftbar" || "${KB_INSTALL_SWIFTBAR:-}" == "1" ]]; then
+    command -v brew >/dev/null \
+      || die "--install-swiftbar given but Homebrew is not installed — get it from https://brew.sh first"
+    info "installing SwiftBar via Homebrew…"
+    brew install --cask swiftbar
+  else
+    cat >&2 <<EOF
+install: error: SwiftBar not found — it is required for the menu bar icon.
+
+  Install it via Homebrew (recommended):
+      brew install --cask swiftbar
+
+  Or re-run this installer with the flag and it will do it for you:
+      plugins/swiftbar/install.sh --install-swiftbar
+
+  Manual alternative: https://github.com/swiftbar/SwiftBar/releases
+EOF
+    exit 1
+  fi
 fi
 
 # --- resolve config (read-only) -------------------------------------------

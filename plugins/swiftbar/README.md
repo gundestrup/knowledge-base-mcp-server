@@ -7,7 +7,8 @@ macOS menu bar for the launchd-managed `knowledge-base-mcp-server`
 
 ## Requires
 
-- macOS + `brew install --cask swiftbar`
+- macOS + SwiftBar (`brew install --cask swiftbar`, or run the installer
+  with `--install-swiftbar` and it will install it via Homebrew for you)
 - The launchd HTTP server already installed, loaded, and healthy
   (see `FORK-NOTES.md` §Local MCP server — the installer refuses to run
   otherwise)
@@ -16,8 +17,8 @@ macOS menu bar for the launchd-managed `knowledge-base-mcp-server`
 ## Install / uninstall
 
 ```bash
-plugins/install.sh     # preflight checks → resolve config → install
-plugins/uninstall.sh   # removes the plugin + menubar.env only
+plugins/swiftbar/install.sh     # preflight checks → resolve config → install
+plugins/swiftbar/uninstall.sh   # removes the plugin + menubar.env only
 ```
 
 The installer verifies **before touching anything**: SwiftBar present,
