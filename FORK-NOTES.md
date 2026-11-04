@@ -60,3 +60,39 @@ Semantics: a CHECKED row requires a matching file in the diff
 one-line reason — that is a valid waiver, not a failure. Evidence that
 doesn't live in a matching file (e.g. test assertions for a perf change)
 belongs in the waiver reason.
+
+## Local MCP server (launchd, HTTP transport)
+
+Devin/Windsurf sessions connect to ONE persistent server instead of
+spawning `node build/index.js` per session — removes the per-session
+index-load/cold-embed penalty (engineering-memory session note 2026-11-04).
+
+- Service: `ai.knowledge-base.mcp` → `~/Library/LaunchAgents/ai.knowledge-base.mcp.plist`
+- Endpoint: `http://127.0.0.1:8090/mcp` (`/health` unauthenticated;
+  `/ready` and `/mcp` need the bearer token). Port 8081 belongs to the
+  KBM-flow dashboard — do not reuse it.
+- Token: `~/.config/kb/mcp-auth-token` (0600), server reads it via
+  `MCP_AUTH_TOKEN_FILE`; client headers carry it in
+  `~/.config/devin/mcp_config.json` (`url` + `transport: http`).
+- Logs: `~/Library/Logs/knowledge-base-mcp.{out,err}.log`
+
+### Upgrade flow
+
+```bash
+git merge upstream/main                                   # sync fork
+npm run build                                             # rebuild build/
+launchctl kickstart -k gui/$(id -u)/ai.knowledge-base.mcp # reload service
+curl -s http://127.0.0.1:8090/health                      # expect {"status":"ok"}
+```
+
+The plist runs `build/index.js`, so a rebuild alone changes nothing until
+the kickstart. Running sessions keep their already-loaded code — they
+pick up the new build on their next launch/connect.
+
+### Manage
+
+```bash
+launchctl print gui/$(id -u)/ai.knowledge-base.mcp        # status/PID
+launchctl kickstart -k gui/$(id -u)/ai.knowledge-base.mcp # restart
+launchctl bootout gui/$(id -u)/ai.knowledge-base.mcp      # stop for good
+```
