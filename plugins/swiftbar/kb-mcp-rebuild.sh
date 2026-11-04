@@ -5,6 +5,7 @@
 set -e
 
 ENV_FILE="${KB_MENUBAR_ENV:-$HOME/.config/kb/menubar.env}"
+# shellcheck source=/dev/null
 [[ -f $ENV_FILE ]] && source "$ENV_FILE"
 
 REPO="${KB_MCP_REPO:-$HOME/workspace/knowledge-base-mcp-server}"

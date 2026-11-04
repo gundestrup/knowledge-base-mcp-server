@@ -42,13 +42,38 @@ or renaming the service.
 `KB ●` — green when launchd reports `running` and `/health` is ok, red
 otherwise. Dropdown: **Rebuild + restart** (npm build → kickstart, in a
 Terminal window), Restart, Stop, Start, log files (Console), Devin MCP
-config, `/health` link.
+config, `/health` link, and **Advanced → Uninstall plugin…** — a
+confirmed self-removal (native dialog; server untouched; falls back to
+deleting just its own files if the checkout is gone).
 
 ## Files
 
 | File | Role |
 |---|---|
-| `kb-mcp.10s.sh` | SwiftBar plugin (refresh every 10 s), copied to `~/Library/Application Support/SwiftBar/Plugins/` |
+| `kb-mcp.10s.sh` | SwiftBar plugin (refresh every 10 s), symlinked into `~/Library/Application Support/SwiftBar/Plugins/` — repo edits go live on the next refresh, no reinstall needed |
 | `kb-mcp-rebuild.sh` | `npm run build` + `launchctl kickstart -k` + health check |
 | `install.sh` | preflight + config resolution + install |
 | `uninstall.sh` | removes plugin files + `menubar.env` only |
+| `kb-mcp-uninstall.sh` | menu-invoked uninstall (dialog confirm, delegates to `uninstall.sh`) |
+| `test.sh` | bash test suite (temp dirs only, never touches the live setup) |
+
+## Testing
+
+```bash
+plugins/swiftbar/test.sh    # 19 checks: reject paths, happy path, uninstall
+```
+
+Uses `KB_PLUGIN_DST`/`KB_MENUBAR_ENV`/`KB_SWIFTBAR_APP`/`KB_MCP_LABEL`/
+`KB_MCP_PORT` overrides to run entirely against temp dirs — the live
+SwiftBar plugin, `menubar.env`, and launchd service are never touched.
+
+## Env overrides
+
+| Var | Default | Purpose |
+|---|---|---|
+| `KB_MCP_LABEL` | `ai.knowledge-base.mcp` | launchd service label |
+| `KB_MCP_PORT` / `KB_MCP_BIND` | resolved from plist | endpoint override |
+| `KB_MENUBAR_ENV` | `~/.config/kb/menubar.env` | env file location |
+| `KB_PLUGIN_DST` | SwiftBar Plugins dir | alternate install target |
+| `KB_SWIFTBAR_APP` | `/Applications/SwiftBar.app` | SwiftBar presence check |
+| `KB_INSTALL_SWIFTBAR` | — | `=1` installs SwiftBar via brew |

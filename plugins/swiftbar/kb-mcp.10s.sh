@@ -6,8 +6,9 @@
 # <xbar.dependencies>bash,curl</xbar.dependencies>
 
 # Paths are resolved at install time into ~/.config/kb/menubar.env —
-# re-run plugins/install.sh after moving the repo or changing the port.
+# re-run plugins/swiftbar/install.sh after moving the repo or changing the port.
 ENV_FILE="${KB_MENUBAR_ENV:-$HOME/.config/kb/menubar.env}"
+# shellcheck source=/dev/null
 [[ -f $ENV_FILE ]] && source "$ENV_FILE"
 
 LABEL="${KB_MCP_LABEL:-ai.knowledge-base.mcp}"
@@ -19,7 +20,33 @@ LOG_OUT="${KB_MCP_LOG_OUT:-$HOME/Library/Logs/knowledge-base-mcp.out.log}"
 MCP_CFG="${KB_MCP_CONFIG:-$HOME/.config/devin/mcp_config.json}"
 DOMAIN="gui/$(id -u)/${LABEL}"
 HEALTH="http://${BIND}:${PORT}/health"
-HELPER="$(cd "$(dirname "$0")" && pwd)/kb-mcp-rebuild.sh"
+
+# Helpers live in the repo checkout, NOT in the plugin dir: SwiftBar
+# recursively executes every executable file it finds there.
+REPO="${KB_MCP_REPO:-$HOME/workspace/knowledge-base-mcp-server}"
+HELPER="$REPO/plugins/swiftbar/kb-mcp-rebuild.sh"
+UNINSTALL="$REPO/plugins/swiftbar/kb-mcp-uninstall.sh"
+UPDATER="$REPO/plugins/swiftbar/update.sh"
+
+# Remote version check — throttled to once per 6h, silent on any failure.
+REMOTE_VER_URL="https://raw.githubusercontent.com/gundestrup/knowledge-base-mcp-server/main/plugins/swiftbar/VERSION"
+CACHE="$HOME/.config/kb/.update-check"
+LOCAL_VER="$(cat "$REPO/plugins/swiftbar/VERSION" 2>/dev/null || echo 0)"
+NOW=$(date +%s); LAST=0
+[[ -f $CACHE ]] && LAST=$(cat "$CACHE" 2>/dev/null || echo 0)
+REMOTE_VER=""
+if (( NOW - LAST > 21600 )); then
+  REMOTE_VER="$(curl -fsSL -m 3 "$REMOTE_VER_URL" 2>/dev/null || true)"
+  mkdir -p "$(dirname "$CACHE")" 2>/dev/null || true
+  echo "$NOW" > "$CACHE" 2>/dev/null || true
+  [[ -n $REMOTE_VER ]] && echo "$REMOTE_VER" > "$CACHE.ver" 2>/dev/null || true
+fi
+[[ -z $REMOTE_VER && -f $CACHE.ver ]] && REMOTE_VER="$(cat "$CACHE.ver" 2>/dev/null || true)"
+UPDATE_AVAIL=0
+if [[ -n $REMOTE_VER && -n $LOCAL_VER ]] && [[ "$REMOTE_VER" != "$LOCAL_VER" ]] && \
+   [[ "$(printf '%s\n%s\n' "$LOCAL_VER" "$REMOTE_VER" | sort -V | tail -1)" == "$REMOTE_VER" ]]; then
+  UPDATE_AVAIL=1
+fi
 
 state="$(launchctl print "$DOMAIN" 2>/dev/null | awk -F' = ' '$1 ~ /state/ {print $2; exit}')"
 pid="$(launchctl print "$DOMAIN" 2>/dev/null | awk -F' = ' '$1 ~ /pid/ {print $2; exit}')"
@@ -44,3 +71,10 @@ echo "Open out log | bash=/usr/bin/open param1=-a param2=Console param3=$LOG_OUT
 echo "Edit Devin MCP config | bash=/usr/bin/open param1=-t param2=$MCP_CFG terminal=false"
 echo "---"
 echo "Health endpoint | href=$HEALTH"
+echo "Advanced"
+if [[ $UPDATE_AVAIL -eq 1 ]]; then
+  echo "-- Update available: $LOCAL_VER → $REMOTE_VER | color=#c62828"
+  echo "-- Run update | bash=$UPDATER terminal=true refresh=true"
+fi
+echo "-- Check for updates | bash=/bin/rm param1=-f param2=$CACHE terminal=false refresh=true"
+echo "-- Uninstall plugin… | bash=$UNINSTALL terminal=false refresh=true"
