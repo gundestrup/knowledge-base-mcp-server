@@ -17,5 +17,3 @@ FORK-NOTES.md
 scripts/prepare-upstream-branch.sh
 scripts/prepare-pr-body.sh
 
-# macOS menu-bar plugin for the local launchd MCP server (SwiftBar).
-plugins/
