@@ -55,6 +55,7 @@ Histogram rows list the base family name; scrapes emit `_bucket`, `_sum`, and `_
 | <code>kb_query_cache_bypasses_total</code> | <code>counter</code> | _none_ | Query embedding cache bypasses. | Always emitted. |
 | <code>kb_query_cache_disk_size_bytes</code> | <code>gauge</code> | _none_ | Query embedding cache disk usage in bytes. | Always emitted. |
 | <code>kb_query_cache_outcomes_total</code> | <code>counter</code> | <code>outcome</code> | Coarse query embedding cache workflow outcomes. | Always emitted. |
+| <code>kb_query_cache_coalesced_total</code> | <code>counter</code> | _none_ | Query embedding cache single-flight coalesced hits: concurrent identical misses deduplicated onto one in-flight embed, each a saved provider embed call. | Always emitted (0 unless single-flight coalescing is enabled and a concurrent identical miss coalesced). |
 | <code>kb_answer_cache_hits_total</code> | <code>counter</code> | _none_ | Answer cache hits. | Emitted when answer-cache stats are available. |
 | <code>kb_answer_cache_misses_total</code> | <code>counter</code> | _none_ | Answer cache misses. | Emitted when answer-cache stats are available. |
 | <code>kb_answer_cache_outcomes_total</code> | <code>counter</code> | <code>outcome</code> | Coarse answer-cache workflow outcomes. | Emitted when answer-cache stats are available. |
@@ -63,6 +64,7 @@ Histogram rows list the base family name; scrapes emit `_bucket`, `_sum`, and `_
 | <code>kb_relevance_gate_verdict_injected_total</code> | <code>counter</code> | _none_ | Relevance gate injected-context verdict count. | Always emitted. |
 | <code>kb_relevance_gate_verdict_no_relevant_context_total</code> | <code>counter</code> | _none_ | Relevance gate no-relevant-context verdict count. | Always emitted. |
 | <code>kb_relevance_gate_verdict_empty_index_total</code> | <code>counter</code> | _none_ | Relevance gate empty-index verdict count. | Always emitted. |
+| <code>kb_relevance_gate_judge_degraded_total</code> | <code>counter</code> | _none_ | Relevance-gate LLM judge degradations where the judge failed and the gate fell back to the statistical path. | Always emitted. |
 | <code>kb_remote_transport_requests_total</code> | <code>counter</code> | _none_ | Remote HTTP/SSE transport requests. | Emitted when HTTP or SSE transport stats are available. |
 | <code>kb_remote_transport_sessions_opened_total</code> | <code>counter</code> | _none_ | Remote HTTP/SSE transport sessions opened. | Emitted when HTTP or SSE transport stats are available. |
 | <code>kb_remote_transport_sessions_closed_total</code> | <code>counter</code> | _none_ | Remote HTTP/SSE transport sessions closed. | Emitted when HTTP or SSE transport stats are available. |

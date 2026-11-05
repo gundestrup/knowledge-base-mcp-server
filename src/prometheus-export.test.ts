@@ -55,6 +55,10 @@ describe('formatKbStatsOpenMetrics', () => {
     expect(text).toContain('kb_rerank_degraded_total 2');
     expect(text).toContain('kb_rerank_skipped_total{reason="skip_domain"} 2');
     expect(text).toContain('kb_rerank_candidates_total{source="model_scored"} 4');
+    expect(text).toContain('kb_relevance_gate_queries_total 2');
+    expect(text).toContain('kb_relevance_gate_verdict_injected_total 1');
+    expect(text).toContain('# TYPE kb_relevance_gate_judge_degraded counter');
+    expect(text).toContain('kb_relevance_gate_judge_degraded_total 3');
     expect(text).toContain('# TYPE kb_rerank_latency_ms histogram');
     expect(text).toContain('kb_rerank_latency_ms_bucket{le="30",source="model_scored"} 1');
     expect(text).toContain('kb_rerank_latency_ms_sum{source="model_scored"} 12');
@@ -177,6 +181,22 @@ describe('formatKbStatsOpenMetrics', () => {
     expect(text).toContain('kb_llm_call_latency_ms_count{operation="ask"} 1');
     expect(text).toContain('# TYPE kb_llm_attributed_call_latency_ms histogram');
     expect(text).toContain('kb_llm_attributed_call_latency_ms_bucket{le="100",model="deepseek",operation="ask",provider="openrouter"} 1');
+  });
+
+  it('emits the query-cache single-flight coalesced counter (issue #1126)', () => {
+    const text = formatKbStatsOpenMetrics(samplePayload());
+
+    expect(text).toContain('# TYPE kb_query_cache_coalesced counter');
+    expect(text).toContain('kb_query_cache_coalesced_total 2');
+  });
+
+  it('emits the query-cache coalesced counter as 0 when the field is absent', () => {
+    const payload = samplePayload();
+    delete payload.query_cache.coalesced;
+
+    const text = formatKbStatsOpenMetrics(payload);
+
+    expect(text).toContain('kb_query_cache_coalesced_total 0');
   });
 
   it('emits provider token counters only when the provider reports token usage', () => {
@@ -403,6 +423,7 @@ function samplePayload(): KbStatsPayload {
       l1_hits: 4,
       disk_hits: 1,
       bypasses: 0,
+      coalesced: 2,
       writes: 6,
       corruptions: 0,
       l1_size: 4,
@@ -425,7 +446,8 @@ function samplePayload(): KbStatsPayload {
       drop_rate_A1: 0,
       drop_rate_A2: 0,
       drop_rate_B: 0,
-      judge_degrade_rate: 0,
+      judge_degrade_rate: 0.25,
+      judge_degraded_total: 3,
       judge_window: {
         size: 2,
         degraded: 0,

@@ -9,6 +9,7 @@ import {
   KB_QUERY_CACHE_DISK_MAX_BYTES,
   KB_QUERY_CACHE_ENABLED,
   KB_QUERY_CACHE_LRU_MAX,
+  KB_QUERY_CACHE_SINGLE_FLIGHT,
 } from './config/cache.js';
 import { pathExists } from './file-utils.js';
 import { logger } from './logger.js';
@@ -35,6 +36,13 @@ export interface QueryCacheStats {
   l1_hits: number;
   disk_hits: number;
   bypasses: number;
+  /**
+   * Concurrent identical cache misses that were deduplicated onto one in-flight
+   * embed by single-flight coalescing (KB_QUERY_CACHE_SINGLE_FLIGHT). Each count
+   * is a provider embed call that coalescing saved; only non-owning (coalesced)
+   * callers are counted, never the owner that performs the embed.
+   */
+  coalesced?: number;
   writes: number;
   corruptions: number;
   l1_size: number;
@@ -121,6 +129,7 @@ export class QueryEmbeddingCache {
   private hitsDisk = 0;
   private misses = 0;
   private bypasses = 0;
+  private coalesced = 0;
   private writes = 0;
   private corruptions = 0;
   private readonly outcomeCounts = {
@@ -206,6 +215,12 @@ export class QueryEmbeddingCache {
     recordOutcome('miss');
     let pending = this.singleFlight ? this.inFlight.get(paths.cacheKey) : undefined;
     const ownsFlight = pending === undefined;
+    if (!ownsFlight) {
+      // Coalesced onto an existing in-flight embed: this miss will reuse the
+      // owner's provider call, so count the saved embed. Never incremented on
+      // the owning path, which performs the embed itself.
+      this.coalesced += 1;
+    }
     if (pending === undefined) {
       pending = (async () => {
         const embedding = await args.embed();
@@ -247,6 +262,7 @@ export class QueryEmbeddingCache {
       l1_hits: this.hitsL1,
       disk_hits: this.hitsDisk,
       bypasses: this.bypasses,
+      coalesced: this.coalesced,
       writes: this.writes,
       corruptions: this.corruptions,
       l1_size: this.l1.size,
@@ -473,7 +489,9 @@ export function __resetQueryEmbeddingCacheForTests(): void {
   queryEmbeddingCache.clearMemory();
 }
 
-export const queryEmbeddingCache = new QueryEmbeddingCache();
+export const queryEmbeddingCache = new QueryEmbeddingCache({
+  singleFlight: KB_QUERY_CACHE_SINGLE_FLIGHT,
+});
 
 function queryCacheRoot(indexPath: string): string {
   return path.join(indexPath, 'cache', 'queries');

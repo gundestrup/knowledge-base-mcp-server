@@ -19,6 +19,7 @@ import {
   ASK_KNOWLEDGE_DESCRIPTION,
   DELETE_DOCUMENT_DESCRIPTION,
   DIFF_INDEX_DESCRIPTION,
+  FIND_RELATED_DESCRIPTION,
   KB_STATS_DESCRIPTION,
   LIST_KNOWLEDGE_BASES_DESCRIPTION,
   LIST_MODELS_DESCRIPTION,
@@ -66,6 +67,12 @@ const boundedGlobString = () =>
 export const RETRIEVE_KNOWLEDGE_INPUT = {
   query: boundedQueryString().describe('The search query to use for retrieving similar chunks from the knowledge base.'),
   knowledge_base_name: z.string().optional().describe('The name of the knowledge base to search. If omitted, all available knowledge bases are considered.'),
+  // Issue #975 — search a named subset of shelves, mirroring the research CLI's
+  // repeatable `--include-kb`. Mutually exclusive with knowledge_base_name:
+  // passing both is a VALIDATION error. Omitting it keeps the single-or-all
+  // scope of knowledge_base_name; an unknown name fails closed with
+  // KB_NOT_FOUND.
+  knowledge_base_names: boundedFilterArray().optional().describe('Search only this named subset of knowledge bases (e.g. ["runbooks", "adr"]). Mutually exclusive with knowledge_base_name — passing both is a VALIDATION error. Omit to keep the knowledge_base_name rule (one named base, or all). An unknown name fails with KB_NOT_FOUND.'),
   threshold: z.number().optional().describe('The maximum similarity score threshold for returned dense documents. Defaults to 2 if not specified; in hybrid mode, the threshold is not applied because both legs are over-fetched for fusion, while metadata filters apply to both legs before fusion.'),
   // RFC 013 M3 §4.5 — optional override of the active embedding model.
   // When omitted, the server uses the model recorded in active.txt.
@@ -103,10 +110,29 @@ export const RETRIEVE_KNOWLEDGE_INPUT = {
 export const ASK_KNOWLEDGE_INPUT = {
   query: boundedQueryString().describe('Question to answer from retrieved knowledge-base snippets.'),
   knowledge_base_name: z.string().optional().describe('Name of a single knowledge base to search. If omitted, all available knowledge bases are considered.'),
+  // Issue #975 — same named-subset scope as retrieve_knowledge.
+  knowledge_base_names: boundedFilterArray().optional().describe('Answer from only this named subset of knowledge bases (e.g. ["runbooks", "adr"]). Mutually exclusive with knowledge_base_name — passing both is a VALIDATION error. Omit to keep the knowledge_base_name rule (one named base, or all). An unknown name fails with KB_NOT_FOUND.'),
   model_name: z.string().optional().describe('Registered embedding model_id to use for retrieval. If omitted, the active model is used.'),
   llm_profile: z.string().optional().describe('Saved kb llm profile name to use for answer generation.'),
   k: z.int().min(1).max(50).optional().describe('Retrieval top-K before context packing. Default 8.'),
   context_budget_tokens: z.int().min(64).optional().describe('Approximate token budget for snippets sent to the LLM. Default 6000.'),
+  // Issue #974 — mirror retrieve_knowledge's metadata POST-filters on the ask
+  // path so an agent can scope the evidence an answer is drawn from without
+  // leaving the tool. ANDed with each other and with the KB scope; in hybrid
+  // mode they apply to lexical candidates before fusion. Omitting them keeps the
+  // unfiltered whole-base search (same hit count and formatting as before).
+  extensions: boundedFilterArray().optional().describe('Limit answer evidence to chunks whose source file has one of these extensions (e.g. [".md", ".pdf"]). Case-insensitive; leading dot optional. In hybrid mode, applied to lexical candidates before fusion.'),
+  path_glob: boundedGlobString().optional().describe('Limit answer evidence to chunks whose KB-internal relative path matches this glob (e.g. "runbooks/**"). The KB-name segment is stripped before matching. In hybrid mode, applied to lexical candidates before fusion.'),
+  tags: boundedFilterArray().optional().describe('Limit answer evidence to chunks whose source file has ALL of these tags in its YAML frontmatter. In hybrid mode, applied to lexical candidates before fusion.'),
+  since: z.string().optional().describe('Limit answer evidence to chunks whose current source-file mtime is at or after this bound. Accepts durations like "30d"/"24h" or ISO dates/timestamps; mtime can differ from indexed-content time on stale indexes. In hybrid mode, applied to lexical candidates before fusion.'),
+  until: z.string().optional().describe('Limit answer evidence to chunks whose current source-file mtime is at or before this bound. Accepts durations like "30d"/"24h" or ISO dates/timestamps; mtime can differ from indexed-content time on stale indexes. In hybrid mode, applied to lexical candidates before fusion.'),
+  // Issue #974 — opt-in neighbor windows, mirroring retrieve_knowledge. As on
+  // retrieve, expansion is only supported with dense retrieval (hybrid/lexical
+  // fusion has no stable neighbor ordering), so a window with a non-dense
+  // effective mode is a VALIDATION error. Defaults stay 0 (no expansion).
+  context_before: z.int().min(0).max(5).optional().describe('Opt-in neighbor context: include up to this many preceding chunks from the same source around each match before packing. Only supported with dense retrieval (search_mode="dense"); the default "auto" stays dense for prose. Defaults to 0.'),
+  context_after: z.int().min(0).max(5).optional().describe('Opt-in neighbor context: include up to this many following chunks from the same source around each match before packing. Only supported with dense retrieval (search_mode="dense"); the default "auto" stays dense for prose. Defaults to 0.'),
+  context_window: z.int().min(0).max(5).optional().describe('Shorthand for setting context_before and context_after to the same value. Only supported with dense retrieval (search_mode="dense"). Defaults to 0.'),
   // #732 — bring the search-mode + opt-in rerank surface of retrieve_knowledge
   // to the ask path. Defaults to 'auto' (prose stays dense, code/error-token
   // queries upgrade to hybrid); reranking stays opt-in.
@@ -133,6 +159,36 @@ export const DIFF_INDEX_INPUT = {
   top_k: z.int().min(1).max(100).optional().describe('Top-K results per query. Default 10.'),
   threshold: z.number().optional().describe('Dense similarity threshold. Default 2.'),
   format: z.enum(['json', 'markdown']).optional().describe('Response format. Default markdown.'),
+};
+
+// Issue #1133 — find_related mirrors the read-only `kb related` CLI: seed-chunk
+// "more-like-this" expansion from an existing result's id/URI. The seed is a
+// chunk id or kb:// URI (not a text query); k/threshold/knowledge_base_name
+// mirror retrieve_knowledge's bounds. all_kbs broadens past the seed KB and is
+// mutually exclusive with knowledge_base_name (VALIDATION); include_self keeps
+// the seed in the results.
+export const FIND_RELATED_INPUT = {
+  chunk_id: z
+    .string()
+    .min(1, 'chunk_id must not be empty')
+    .describe('The seed chunk to expand from: a public chunk id (e.g. "alpha/docs/deploy.md#L42-L78") or a kb:// resource URI from a prior retrieve_knowledge result. A bare <kb>/<path> location is rejected because it cannot name a single chunk.'),
+  knowledge_base_name: z
+    .string()
+    .optional()
+    .describe('Scope the related search to this knowledge base. Defaults to the seed chunk\'s own knowledge base. Mutually exclusive with all_kbs — passing both is a VALIDATION error.'),
+  all_kbs: z
+    .boolean()
+    .optional()
+    .describe('Search across all knowledge bases instead of the default seed-KB scope. Mutually exclusive with knowledge_base_name.'),
+  k: z.int().min(1).max(50).optional().describe('Related results to return. Default 10.'),
+  threshold: z
+    .number()
+    .optional()
+    .describe('Maximum dense similarity score; lower = closer match. Default 2.'),
+  include_self: z
+    .boolean()
+    .optional()
+    .describe('Keep the seed chunk in the result set. Omitted/false excludes it (the default).'),
 };
 
 export const ADD_DOCUMENT_INPUT = {
@@ -174,7 +230,7 @@ export interface McpToolSpec {
   annotations: ToolAnnotations;
 }
 
-// Shared annotation objects. The six readers do not modify their environment;
+// Shared annotation objects. The seven readers do not modify their environment;
 // per the MCP spec `destructiveHint`/`idempotentHint` are meaningful only when
 // `readOnlyHint === false`, so a lone `readOnlyHint: true` is the complete hint
 // for a reader.
@@ -189,6 +245,8 @@ export const MCP_TOOL_SPECS: McpToolSpec[] = [
   { name: 'list_models', description: LIST_MODELS_DESCRIPTION, annotations: READ_ONLY_ANNOTATIONS },
   { name: 'kb_stats', description: KB_STATS_DESCRIPTION, inputShape: KB_STATS_INPUT, annotations: READ_ONLY_ANNOTATIONS },
   { name: 'diff_index', description: DIFF_INDEX_DESCRIPTION, inputShape: DIFF_INDEX_INPUT, annotations: READ_ONLY_ANNOTATIONS },
+  // Issue #1133 — read-only seed-chunk "more-like-this" expansion mirroring `kb related`.
+  { name: 'find_related', description: FIND_RELATED_DESCRIPTION, inputShape: FIND_RELATED_INPUT, annotations: READ_ONLY_ANNOTATIONS },
   // add_document writes a document: not read-only, and additive rather than
   // destructive (it creates/overwrites a single path). Re-writing the same
   // path+content leaves the KB in the same state, so it is idempotent.

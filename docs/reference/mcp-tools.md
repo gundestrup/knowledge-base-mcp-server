@@ -11,7 +11,7 @@ name, description, or input schema, and commit the result. The
 `docs:check-mcp-tools` gate (part of `npm run check`) fails if this file
 drifts.
 
-The server exposes 9 tools, 3 of which are only registered when `KB_INGEST_ENABLED` is set.
+The server exposes 10 tools, 3 of which are only registered when `KB_INGEST_ENABLED` is set.
 
 ## Tools
 
@@ -23,6 +23,7 @@ The server exposes 9 tools, 3 of which are only registered when `KB_INGEST_ENABL
 | [`list_models`](#list_models) | — | Lists the embedding models registered for retrieval. Returns an array of {model_id, provider, model_name, active}. Use the model_id as the optional `model_name` argument to retrieve_knowledge to query a specific model instead of the active default. |
 | [`kb_stats`](#kb_stats) | — | Reports observability stats for the knowledge base index: per-KB file_count, chunk_count, total_bytes_indexed and last_updated_at; the active embedding provider/model/dim; the on-disk index_path; server version/commit/uptime; process-lifetime chat-completion calls with bounded provider/model attribution, attempts/retries, cache outcomes, and answer impact; answer-cache counters; and HTTP/SSE transport counters when a remote transport is active. Pass `knowledge_base_name` to scope to a single KB; omit it to get an entry per registered KB. |
 | [`diff_index`](#diff_index) | — | Compares retrieval-result churn across two persisted FAISS index versions for a list of plaintext queries. Returns rank deltas, top-K membership changes, and stability/churn scores; useful before promoting a new index version. |
+| [`find_related`](#find_related) | — | Finds chunks semantically similar to an existing result ("more-like-this"), seeded by a chunk id or kb:// URI from a prior retrieve_knowledge hit rather than a text query. Resolves the seed chunk from the active index and runs dense similarity search on its text, excluding the seed itself by default. Read-only. Returns a kb.related.v1 JSON payload (seed, scoped_kb, related results). Defaults: k=10, threshold=2, scoped to the seed chunk's knowledge base; pass all_kbs=true to search every KB or include_self=true to keep the seed in the results. |
 | [`add_document`](#add_document) | `KB_INGEST_ENABLED` | Adds or overwrites a UTF-8 document in a knowledge base, creating parent directories as needed, then updates the active model index so the new content is queryable immediately. |
 | [`delete_document`](#delete_document) | `KB_INGEST_ENABLED` | DESTRUCTIVE: Deletes a document from a knowledge base and removes its hash sidecar. FAISS does not support vector deletion in this server, so orphan vectors for the removed file persist until a full rebuild; run reindex_knowledge_base after deletes if vector hygiene matters. |
 | [`reindex_knowledge_base`](#reindex_knowledge_base) | `KB_INGEST_ENABLED` | Forces the active model to fully rebuild its FAISS index from on-disk files, replacing the in-memory store and clearing orphan vectors left behind by prior delete_document calls. The rebuild always covers every KB because FAISS lacks per-vector deletion; passing knowledge_base_name is accepted (and recorded in the response) but does not narrow the rebuild scope. |
@@ -41,6 +42,7 @@ Retrieves similar chunks from the knowledge base based on a query. Optionally, i
 | --- | --- | --- | --- | --- |
 | `query` | string | yes | max 8192 chars | The search query to use for retrieving similar chunks from the knowledge base. |
 | `knowledge_base_name` | string | no | — | The name of the knowledge base to search. If omitted, all available knowledge bases are considered. |
+| `knowledge_base_names` | array of string | no | max 64 items | Search only this named subset of knowledge bases (e.g. ["runbooks", "adr"]). Mutually exclusive with knowledge_base_name — passing both is a VALIDATION error. Omit to keep the knowledge_base_name rule (one named base, or all). An unknown name fails with KB_NOT_FOUND. |
 | `threshold` | number | no | — | The maximum similarity score threshold for returned dense documents. Defaults to 2 if not specified; in hybrid mode, the threshold is not applied because both legs are over-fetched for fusion, while metadata filters apply to both legs before fusion. |
 | `model_name` | string | no | — | The model_id of an alternate embedding model to query (e.g. "openai__text-embedding-3-small"). If omitted, the active model is used. Run list_models for available ids. |
 | `extensions` | array of string | no | max 64 items | Limit results to chunks whose source file has one of these extensions (e.g. [".md", ".pdf"]). Case-insensitive; leading dot optional. In hybrid mode, applied to lexical candidates before fusion. |
@@ -65,10 +67,19 @@ Answers a question from retrieved knowledge-base context using the configured lo
 | --- | --- | --- | --- | --- |
 | `query` | string | yes | max 8192 chars | Question to answer from retrieved knowledge-base snippets. |
 | `knowledge_base_name` | string | no | — | Name of a single knowledge base to search. If omitted, all available knowledge bases are considered. |
+| `knowledge_base_names` | array of string | no | max 64 items | Answer from only this named subset of knowledge bases (e.g. ["runbooks", "adr"]). Mutually exclusive with knowledge_base_name — passing both is a VALIDATION error. Omit to keep the knowledge_base_name rule (one named base, or all). An unknown name fails with KB_NOT_FOUND. |
 | `model_name` | string | no | — | Registered embedding model_id to use for retrieval. If omitted, the active model is used. |
 | `llm_profile` | string | no | — | Saved kb llm profile name to use for answer generation. |
 | `k` | integer | no | min 1; max 50 | Retrieval top-K before context packing. Default 8. |
 | `context_budget_tokens` | integer | no | min 64 | Approximate token budget for snippets sent to the LLM. Default 6000. |
+| `extensions` | array of string | no | max 64 items | Limit answer evidence to chunks whose source file has one of these extensions (e.g. [".md", ".pdf"]). Case-insensitive; leading dot optional. In hybrid mode, applied to lexical candidates before fusion. |
+| `path_glob` | string | no | max 1024 chars | Limit answer evidence to chunks whose KB-internal relative path matches this glob (e.g. "runbooks/**"). The KB-name segment is stripped before matching. In hybrid mode, applied to lexical candidates before fusion. |
+| `tags` | array of string | no | max 64 items | Limit answer evidence to chunks whose source file has ALL of these tags in its YAML frontmatter. In hybrid mode, applied to lexical candidates before fusion. |
+| `since` | string | no | — | Limit answer evidence to chunks whose current source-file mtime is at or after this bound. Accepts durations like "30d"/"24h" or ISO dates/timestamps; mtime can differ from indexed-content time on stale indexes. In hybrid mode, applied to lexical candidates before fusion. |
+| `until` | string | no | — | Limit answer evidence to chunks whose current source-file mtime is at or before this bound. Accepts durations like "30d"/"24h" or ISO dates/timestamps; mtime can differ from indexed-content time on stale indexes. In hybrid mode, applied to lexical candidates before fusion. |
+| `context_before` | integer | no | min 0; max 5 | Opt-in neighbor context: include up to this many preceding chunks from the same source around each match before packing. Only supported with dense retrieval (search_mode="dense"); the default "auto" stays dense for prose. Defaults to 0. |
+| `context_after` | integer | no | min 0; max 5 | Opt-in neighbor context: include up to this many following chunks from the same source around each match before packing. Only supported with dense retrieval (search_mode="dense"); the default "auto" stays dense for prose. Defaults to 0. |
+| `context_window` | integer | no | min 0; max 5 | Shorthand for setting context_before and context_after to the same value. Only supported with dense retrieval (search_mode="dense"). Defaults to 0. |
 | `search_mode` | enum | no | one of: `dense`, `hybrid`, `lexical`, `auto` | Retrieval mode for the snippets fed to the answer LLM. "auto" (default) keeps dense for prose and upgrades code/error-token queries to hybrid; "dense" is FAISS-only; "hybrid" fuses FAISS + per-KB BM25 via Reciprocal Rank Fusion; "lexical" is BM25-only. See #206 + #732. |
 | `rerank` | enum | no | one of: `on`, `off` | Per-call RFC 019 cross-encoder reranker override for hybrid retrieval. Off by default; omit to use KB_RERANK. |
 | `task_context` | string | no | — | Optional task context passed to the answer prompt and relevance gate when enabled. |
@@ -103,6 +114,19 @@ Compares retrieval-result churn across two persisted FAISS index versions for a 
 | `top_k` | integer | no | min 1; max 100 | Top-K results per query. Default 10. |
 | `threshold` | number | no | — | Dense similarity threshold. Default 2. |
 | `format` | enum | no | one of: `json`, `markdown` | Response format. Default markdown. |
+
+## `find_related`
+
+Finds chunks semantically similar to an existing result ("more-like-this"), seeded by a chunk id or kb:// URI from a prior retrieve_knowledge hit rather than a text query. Resolves the seed chunk from the active index and runs dense similarity search on its text, excluding the seed itself by default. Read-only. Returns a kb.related.v1 JSON payload (seed, scoped_kb, related results). Defaults: k=10, threshold=2, scoped to the seed chunk's knowledge base; pass all_kbs=true to search every KB or include_self=true to keep the seed in the results.
+
+| Field | Type | Required | Constraints | Description |
+| --- | --- | --- | --- | --- |
+| `chunk_id` | string | yes | min 1 chars | The seed chunk to expand from: a public chunk id (e.g. "alpha/docs/deploy.md#L42-L78") or a kb:// resource URI from a prior retrieve_knowledge result. A bare <kb>/<path> location is rejected because it cannot name a single chunk. |
+| `knowledge_base_name` | string | no | — | Scope the related search to this knowledge base. Defaults to the seed chunk's own knowledge base. Mutually exclusive with all_kbs — passing both is a VALIDATION error. |
+| `all_kbs` | boolean | no | — | Search across all knowledge bases instead of the default seed-KB scope. Mutually exclusive with knowledge_base_name. |
+| `k` | integer | no | min 1; max 50 | Related results to return. Default 10. |
+| `threshold` | number | no | — | Maximum dense similarity score; lower = closer match. Default 2. |
+| `include_self` | boolean | no | — | Keep the seed chunk in the result set. Omitted/false excludes it (the default). |
 
 ## `add_document`
 

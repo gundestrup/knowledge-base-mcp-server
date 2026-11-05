@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, jest } from '@jest/globals';
+import { afterEach, beforeEach, describe, expect, it, jest } from '@jest/globals';
 import * as fsp from 'node:fs/promises';
 import * as http from 'node:http';
 import * as os from 'node:os';
@@ -8,12 +8,21 @@ import {
   createDaemonCommandHandlers,
   createWarmCorpusStatsHandler,
   type DaemonCommandHandlers,
+  DEFAULT_DAEMON_HEADERS_TIMEOUT_MS,
+  DEFAULT_DAEMON_KEEP_ALIVE_TIMEOUT_MS,
+  DEFAULT_DAEMON_MAX_CONNECTIONS,
+  DEFAULT_DAEMON_REQUEST_TIMEOUT_MS,
   formatStatsRunResultAsOpenMetrics,
   gracefulDrain,
   parseServeArgs,
+  resolveDaemonHttpLimits,
+  runServe,
   runServeStatus,
+  runServeStop,
+  type ServeStopDeps,
   startDaemonServer,
 } from './cli-serve.js';
+import { spawn } from 'node:child_process';
 import type { RunStatsDeps } from './cli-stats.js';
 import {
   DaemonAdmissionGate,
@@ -25,7 +34,13 @@ import {
   MAX_DAEMON_CONCURRENCY,
   MAX_DAEMON_QUEUE_MAX,
 } from './daemon-admission.js';
-import { fetchDaemonHealth, runDaemonCommand, type DaemonRunResult } from './daemon-client.js';
+import {
+  fetchDaemonHealth,
+  runDaemonCommand,
+  tryFetchDaemonHealth,
+  type DaemonHealth,
+  type DaemonRunResult,
+} from './daemon-client.js';
 import { CorpusSizeCache, type KbStatsPayload } from './kb-stats.js';
 import type { RunSearchDeps } from './cli-search.js';
 import type { LexicalIndex } from './lexical-index.js';
@@ -39,7 +54,7 @@ interface RawResponse {
 
 function request(
   url: URL,
-  options: { method?: string; path: string; body?: unknown },
+  options: { method?: string; path: string; body?: unknown; headers?: http.OutgoingHttpHeaders },
 ): Promise<RawResponse> {
   return new Promise((resolve, reject) => {
     const req = http.request(
@@ -48,7 +63,10 @@ function request(
         port: url.port,
         method: options.method ?? 'GET',
         path: options.path,
-        headers: options.body === undefined ? undefined : { 'Content-Type': 'application/json' },
+        headers: {
+          ...(options.body === undefined ? {} : { 'Content-Type': 'application/json' }),
+          ...options.headers,
+        },
       },
       (res) => {
         const chunks: Buffer[] = [];
@@ -764,6 +782,162 @@ describe('kb serve daemon admission control', () => {
   });
 });
 
+describe('kb serve idle shutdown timer (issue #1124)', () => {
+  const itUnix = process.platform === 'win32' ? it.skip : it;
+  const originalMetricsExport = process.env.KB_METRICS_EXPORT;
+
+  // Health and metrics probes arrive through the same http.createServer handler
+  // as real commands. Fake timers let us assert whether a given request stream
+  // postpones the idle-shutdown deadline without waiting real wall-clock time.
+  // `setImmediate` is left real so the HTTP machinery keeps flowing while the
+  // idle `setTimeout` is under the fake clock's control.
+  const ok = (): DaemonRunResult => ({ exitCode: 0, stdout: 'ok\n', stderr: '' });
+  const idleHandlers = (): DaemonCommandHandlers => ({
+    search: async () => ok(),
+    list: async () => ok(),
+    stats: async () => ok(),
+  });
+
+  beforeEach(() => {
+    // Exercise the realistic Prometheus scrape path: /metrics answering 200.
+    process.env.KB_METRICS_EXPORT = 'on';
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+    if (originalMetricsExport === undefined) delete process.env.KB_METRICS_EXPORT;
+    else process.env.KB_METRICS_EXPORT = originalMetricsExport;
+  });
+
+  itUnix('repeated /health and /metrics polls do not postpone idle shutdown', async () => {
+    jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick'] });
+    const idleTimeoutMs = 10_000;
+    const daemon = await startDaemonServer({
+      port: 0,
+      idleTimeoutMs,
+      warm: false,
+      handlers: idleHandlers(),
+      metricsHandler: async () => '# EOF\n',
+    });
+    try {
+      // Advance halfway to the deadline, then hammer the unauthenticated probes
+      // the way a status cron / autostart health loop / Prometheus scrape would.
+      jest.advanceTimersByTime(idleTimeoutMs / 2);
+      for (let i = 0; i < 3; i += 1) {
+        const health = await request(daemon.url, {
+          path: '/health',
+          headers: { Connection: 'close' },
+        });
+        expect(health.statusCode).toBe(200);
+        const metrics = await request(daemon.url, {
+          path: '/metrics',
+          headers: { Connection: 'close' },
+        });
+        expect(metrics.statusCode).toBe(200);
+      }
+      // Still before the ORIGINAL deadline — the daemon is alive.
+      expect(daemon.server.listening).toBe(true);
+      // Cross the original deadline. Because the probes did NOT re-arm the idle
+      // timer, the daemon shuts down on the operator's configured schedule.
+      jest.advanceTimersByTime(idleTimeoutMs / 2);
+      expect(daemon.server.listening).toBe(false);
+    } finally {
+      jest.useRealTimers();
+      await daemon.stop();
+    }
+  });
+
+  itUnix('a real /v1/run command postpones idle shutdown', async () => {
+    jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick'] });
+    const idleTimeoutMs = 10_000;
+    const daemon = await startDaemonServer({
+      port: 0,
+      idleTimeoutMs,
+      warm: false,
+      handlers: idleHandlers(),
+      metricsHandler: async () => '# EOF\n',
+    });
+    try {
+      // A real client command arrives at t=8s, before the t=10s deadline.
+      jest.advanceTimersByTime(8_000);
+      const run = await request(daemon.url, {
+        method: 'POST',
+        path: '/v1/run',
+        body: { command: 'search', args: ['q'] },
+        headers: { Connection: 'close' },
+      });
+      expect(run.statusCode).toBe(200);
+      // The command re-armed the timer to t=18s. Crossing the ORIGINAL t=10s
+      // deadline must NOT shut the daemon down.
+      jest.advanceTimersByTime(3_000); // t=11s
+      expect(daemon.server.listening).toBe(true);
+      // Cross the postponed deadline — now the daemon reclaims.
+      jest.advanceTimersByTime(idleTimeoutMs); // t=21s, past t=18s
+      expect(daemon.server.listening).toBe(false);
+    } finally {
+      jest.useRealTimers();
+      await daemon.stop();
+    }
+  });
+
+  itUnix('an untouched daemon reclaims after exactly one idle interval', async () => {
+    // Guards the default-behavior-unchanged criterion: with no traffic at all
+    // the daemon must still shut down after exactly one idle interval.
+    jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick'] });
+    const idleTimeoutMs = 10_000;
+    const daemon = await startDaemonServer({
+      port: 0,
+      idleTimeoutMs,
+      warm: false,
+      handlers: idleHandlers(),
+      metricsHandler: async () => '# EOF\n',
+    });
+    try {
+      expect(daemon.server.listening).toBe(true);
+      jest.advanceTimersByTime(idleTimeoutMs - 1);
+      expect(daemon.server.listening).toBe(true);
+      jest.advanceTimersByTime(1);
+      expect(daemon.server.listening).toBe(false);
+    } finally {
+      jest.useRealTimers();
+      await daemon.stop();
+    }
+  });
+
+  itUnix('a malformed /v1/run request does not postpone idle shutdown', async () => {
+    // The idle reset fires only for a VALIDATED, admissible command — not for
+    // every request that happens to hit /v1/run. A garbage POST (400) must not
+    // become a backdoor that keeps the daemon resident the way the probes did.
+    jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick'] });
+    const idleTimeoutMs = 10_000;
+    const daemon = await startDaemonServer({
+      port: 0,
+      idleTimeoutMs,
+      warm: false,
+      handlers: idleHandlers(),
+      metricsHandler: async () => '# EOF\n',
+    });
+    try {
+      jest.advanceTimersByTime(idleTimeoutMs / 2);
+      const bad = await request(daemon.url, {
+        method: 'POST',
+        path: '/v1/run',
+        body: 'not json at all',
+        headers: { Connection: 'close' },
+      });
+      expect(bad.statusCode).toBe(400);
+      expect(daemon.server.listening).toBe(true);
+      // Crossing the ORIGINAL deadline still reclaims: the bad request did not
+      // re-arm the timer.
+      jest.advanceTimersByTime(idleTimeoutMs / 2);
+      expect(daemon.server.listening).toBe(false);
+    } finally {
+      jest.useRealTimers();
+      await daemon.stop();
+    }
+  });
+});
+
 describe('kb serve graceful drain on shutdown (issue #735)', () => {
   const originalDrainTimeout = process.env.KB_DAEMON_DRAIN_TIMEOUT_MS;
 
@@ -1003,6 +1177,7 @@ function sampleKbStatsPayload(): KbStatsPayload {
       drop_rate_A2: 0,
       drop_rate_B: 0,
       judge_degrade_rate: 0,
+      judge_degraded_total: 0,
       judge_window: {
         size: 0,
         degraded: 0,
@@ -1259,3 +1434,519 @@ describe('kb serve status', () => {
     expect(stdout).not.toContain('start one with');
   });
 });
+
+describe('kb serve daemon socket hardening (issue #1029)', () => {
+  it('resolveDaemonHttpLimits fills unset fields with safe defaults', () => {
+    expect(resolveDaemonHttpLimits()).toEqual({
+      requestTimeoutMs: DEFAULT_DAEMON_REQUEST_TIMEOUT_MS,
+      headersTimeoutMs: DEFAULT_DAEMON_HEADERS_TIMEOUT_MS,
+      keepAliveTimeoutMs: DEFAULT_DAEMON_KEEP_ALIVE_TIMEOUT_MS,
+      maxConnections: DEFAULT_DAEMON_MAX_CONNECTIONS,
+    });
+  });
+
+  it('resolveDaemonHttpLimits honours per-field overrides', () => {
+    expect(resolveDaemonHttpLimits({ requestTimeoutMs: 11, maxConnections: 3 })).toEqual({
+      requestTimeoutMs: 11,
+      headersTimeoutMs: DEFAULT_DAEMON_HEADERS_TIMEOUT_MS,
+      keepAliveTimeoutMs: DEFAULT_DAEMON_KEEP_ALIVE_TIMEOUT_MS,
+      maxConnections: 3,
+    });
+  });
+
+  it('applies the safe defaults to the listening daemon server', async () => {
+    const daemon = await startDaemonServer({ port: 0, idleTimeoutMs: 0 });
+    try {
+      expect(daemon.server.requestTimeout).toBe(DEFAULT_DAEMON_REQUEST_TIMEOUT_MS);
+      expect(daemon.server.headersTimeout).toBe(DEFAULT_DAEMON_HEADERS_TIMEOUT_MS);
+      expect(daemon.server.keepAliveTimeout).toBe(DEFAULT_DAEMON_KEEP_ALIVE_TIMEOUT_MS);
+      expect(daemon.server.maxConnections).toBe(DEFAULT_DAEMON_MAX_CONNECTIONS);
+    } finally {
+      await daemon.stop();
+    }
+  });
+
+  it('reflects explicit httpLimits on the listening daemon server', async () => {
+    const daemon = await startDaemonServer({
+      port: 0,
+      idleTimeoutMs: 0,
+      httpLimits: {
+        requestTimeoutMs: 33_333,
+        headersTimeoutMs: 4_444,
+        keepAliveTimeoutMs: 1_234,
+        maxConnections: 5,
+      },
+    });
+    try {
+      expect(daemon.server.requestTimeout).toBe(33_333);
+      expect(daemon.server.headersTimeout).toBe(4_444);
+      expect(daemon.server.keepAliveTimeout).toBe(1_234);
+      expect(daemon.server.maxConnections).toBe(5);
+    } finally {
+      await daemon.stop();
+    }
+  });
+
+  it('leaves the daemon connection count uncapped when maxConnections is 0', async () => {
+    const daemon = await startDaemonServer({
+      port: 0,
+      idleTimeoutMs: 0,
+      httpLimits: { maxConnections: 0 },
+    });
+    try {
+      expect(daemon.server.maxConnections).not.toBe(0);
+    } finally {
+      await daemon.stop();
+    }
+  });
+});
+
+describe('kb serve stop (issue #1134)', () => {
+  const localEndpoint = { url: new URL('http://127.0.0.1:17799/') };
+
+  async function captureStop(
+    args: string[],
+    deps: ServeStopDeps,
+    verbosity: Parameters<typeof runServeStop>[1] = 'normal',
+  ): Promise<{ code: number; stdout: string; stderr: string }> {
+    const out: string[] = [];
+    const err: string[] = [];
+    const originalOut = process.stdout.write;
+    const originalErr = process.stderr.write;
+    const sink = (store: string[]) => ((chunk: unknown, ...rest: unknown[]) => {
+      store.push(String(chunk));
+      const callback = rest.find((arg): arg is (e?: Error) => void => typeof arg === 'function');
+      if (callback) callback();
+      return true;
+    }) as typeof process.stdout.write;
+    process.stdout.write = sink(out);
+    process.stderr.write = sink(err);
+    try {
+      const code = await runServeStop(args, verbosity, {
+        endpointFromEnv: () => localEndpoint,
+        ...deps,
+      });
+      return { code, stdout: out.join(''), stderr: err.join('') };
+    } finally {
+      process.stdout.write = originalOut;
+      process.stderr.write = originalErr;
+    }
+  }
+
+  const healthy: DaemonHealth = { status: 'ok', pid: 4242, url: localEndpoint.url.href };
+
+  it('signals SIGTERM to the reported pid and confirms /health went quiet', async () => {
+    const kill = jest.fn();
+    // First fetch is the preflight; the second poll sees the daemon gone.
+    const fetchHealth = jest.fn<() => Promise<DaemonHealth | null>>()
+      .mockResolvedValueOnce(healthy)
+      .mockResolvedValueOnce(null);
+    const result = await captureStop([], {
+      fetchHealth,
+      kill,
+      isPidAlive: () => true,
+    });
+    expect(result.code).toBe(0);
+    expect(kill).toHaveBeenCalledWith(4242, 'SIGTERM');
+    expect(result.stdout).toContain('stopped daemon (pid 4242)');
+  });
+
+  it('emits a machine-readable stop envelope with --json', async () => {
+    const fetchHealth = jest.fn<() => Promise<DaemonHealth | null>>()
+      .mockResolvedValueOnce(healthy)
+      .mockResolvedValueOnce(null);
+    const result = await captureStop(['--json'], {
+      fetchHealth,
+      kill: jest.fn(),
+      isPidAlive: () => true,
+    });
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({
+      stopped: true,
+      pid: 4242,
+      url: localEndpoint.url.href,
+    });
+  });
+
+  it('--quiet suppresses the confirmation line but still exits 0', async () => {
+    const fetchHealth = jest.fn<() => Promise<DaemonHealth | null>>()
+      .mockResolvedValueOnce(healthy)
+      .mockResolvedValueOnce(null);
+    const result = await captureStop([], {
+      fetchHealth,
+      kill: jest.fn(),
+      isPidAlive: () => true,
+    }, 'quiet');
+    expect(result.code).toBe(0);
+    expect(result.stdout).toBe('');
+  });
+
+  it('exits 3 and reports when no daemon is running', async () => {
+    const kill = jest.fn();
+    const result = await captureStop([], {
+      fetchHealth: async () => null,
+      kill,
+    });
+    expect(result.code).toBe(3);
+    expect(result.stdout).toContain('no daemon running');
+    expect(kill).not.toHaveBeenCalled();
+  });
+
+  it('exits 3 with a reachable:false envelope under --json when nothing runs', async () => {
+    const result = await captureStop(['--json'], {
+      fetchHealth: async () => null,
+      kill: jest.fn(),
+    });
+    expect(result.code).toBe(3);
+    expect(JSON.parse(result.stdout)).toEqual({
+      stopped: false,
+      reachable: false,
+      url: localEndpoint.url.href,
+    });
+  });
+
+  it('rejects unknown arguments with exit code 2', async () => {
+    const kill = jest.fn();
+    const result = await captureStop(['--bogus'], { fetchHealth: async () => healthy, kill });
+    expect(result.code).toBe(2);
+    expect(kill).not.toHaveBeenCalled();
+  });
+
+  it('refuses to signal a non-local daemon URL (exit 2, no signal)', async () => {
+    const kill = jest.fn();
+    const fetchHealth = jest.fn<() => Promise<DaemonHealth | null>>();
+    const result = await captureStop([], {
+      endpointFromEnv: () => ({ url: new URL('http://10.1.2.3:17799/') }),
+      fetchHealth,
+      kill,
+    });
+    expect(result.code).toBe(2);
+    expect(kill).not.toHaveBeenCalled();
+    // Never even probes /health for a daemon it cannot safely signal.
+    expect(fetchHealth).not.toHaveBeenCalled();
+    expect(result.stderr).toContain('refusing to signal a non-local daemon');
+  });
+
+  it('signals a Unix-domain socket daemon (treated as local)', async () => {
+    const kill = jest.fn();
+    const fetchHealth = jest.fn<() => Promise<DaemonHealth | null>>()
+      .mockResolvedValueOnce({ status: 'ok', pid: 77 })
+      .mockResolvedValueOnce(null);
+    const result = await captureStop([], {
+      endpointFromEnv: () => ({ url: new URL('unix:///tmp/kb.sock'), socketPath: '/tmp/kb.sock' }),
+      fetchHealth,
+      kill,
+      isPidAlive: () => true,
+    });
+    expect(result.code).toBe(0);
+    expect(kill).toHaveBeenCalledWith(77, 'SIGTERM');
+  });
+
+  it('exits 1 when the daemon reports no usable pid', async () => {
+    const kill = jest.fn();
+    const result = await captureStop([], {
+      fetchHealth: async () => ({ status: 'ok' }),
+      kill,
+    });
+    expect(result.code).toBe(1);
+    expect(kill).not.toHaveBeenCalled();
+    expect(result.stderr).toContain('did not report a usable pid');
+  });
+
+  it('exits 1 when the reported pid is not a live local process', async () => {
+    const kill = jest.fn();
+    const result = await captureStop([], {
+      fetchHealth: async () => healthy,
+      kill,
+      isPidAlive: () => false,
+    });
+    expect(result.code).toBe(1);
+    expect(kill).not.toHaveBeenCalled();
+    expect(result.stderr).toContain('not a live local process');
+  });
+
+  it('exits 1 when the daemon /health payload is unusable', async () => {
+    const kill = jest.fn();
+    const result = await captureStop([], {
+      fetchHealth: async () => {
+        throw new Error('daemon /health returned a non-object payload');
+      },
+      kill,
+    });
+    expect(result.code).toBe(1);
+    expect(kill).not.toHaveBeenCalled();
+  });
+
+  it('treats ESRCH on signal as an already-stopped daemon (exit 0)', async () => {
+    const kill = jest.fn(() => {
+      const err = new Error('kill ESRCH') as NodeJS.ErrnoException;
+      err.code = 'ESRCH';
+      throw err;
+    });
+    const result = await captureStop([], {
+      fetchHealth: async () => healthy,
+      kill,
+      isPidAlive: () => true,
+    });
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain('stopped daemon (pid 4242)');
+  });
+
+  it('exits 1 when signalling fails for another reason (e.g. EPERM)', async () => {
+    const kill = jest.fn(() => {
+      const err = new Error('kill EPERM') as NodeJS.ErrnoException;
+      err.code = 'EPERM';
+      throw err;
+    });
+    const result = await captureStop([], {
+      fetchHealth: async () => healthy,
+      kill,
+      isPidAlive: () => true,
+    });
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain('failed to signal daemon pid 4242');
+  });
+
+  it('exits 1 when the daemon stays reachable past the stop deadline', async () => {
+    let clock = 0;
+    const kill = jest.fn();
+    const fetchHealth = jest.fn<() => Promise<DaemonHealth | null>>().mockResolvedValue(healthy);
+    const result = await captureStop([], {
+      fetchHealth,
+      kill,
+      isPidAlive: () => true,
+      now: () => clock,
+      sleep: async (ms: number) => {
+        clock += ms;
+      },
+      timeoutMs: 300,
+      pollIntervalMs: 100,
+    });
+    expect(result.code).toBe(1);
+    expect(kill).toHaveBeenCalledWith(4242, 'SIGTERM');
+    expect(result.stderr).toContain('still reachable');
+    // 1 preflight + 3 polls at t=0,100,200 before the t=300 deadline: the loop
+    // spans the whole budget rather than giving up after the signal.
+    expect(fetchHealth).toHaveBeenCalledTimes(4);
+  });
+
+  it.each([0, -1, 1.5, Number.NaN])(
+    'exits 1 without signalling when the reported pid is invalid (%p)',
+    async (pid) => {
+      const kill = jest.fn();
+      const result = await captureStop([], {
+        fetchHealth: async () => ({ status: 'ok', pid: pid as number }),
+        kill,
+        isPidAlive: () => true,
+      });
+      // Guards pid <= 0 / non-integer so `process.kill(0)` or `kill(-1)` can
+      // never fan a signal out to a whole process group.
+      expect(result.code).toBe(1);
+      expect(kill).not.toHaveBeenCalled();
+      expect(result.stderr).toContain('did not report a usable pid');
+    },
+  );
+
+  it.each(['localhost', '[::1]'])(
+    'treats loopback host %s as local and signals it',
+    async (hostname) => {
+      const kill = jest.fn();
+      const fetchHealth = jest.fn<() => Promise<DaemonHealth | null>>()
+        .mockResolvedValueOnce({ status: 'ok', pid: 55 })
+        .mockResolvedValueOnce(null);
+      const result = await captureStop([], {
+        endpointFromEnv: () => ({ url: new URL(`http://${hostname}:17799/`) }),
+        fetchHealth,
+        kill,
+        isPidAlive: () => true,
+      });
+      expect(result.code).toBe(0);
+      expect(kill).toHaveBeenCalledWith(55, 'SIGTERM');
+    },
+  );
+
+  it.each(['localhost.evil.com', '127.0.0.1.evil.com', '0.0.0.0', '10.0.0.4'])(
+    'refuses a non-loopback host %s (exit 2, no signal, no probe)',
+    async (hostname) => {
+      const kill = jest.fn();
+      const fetchHealth = jest.fn<() => Promise<DaemonHealth | null>>();
+      const result = await captureStop([], {
+        endpointFromEnv: () => ({ url: new URL(`http://${hostname}:17799/`) }),
+        fetchHealth,
+        kill,
+        isPidAlive: () => true,
+      });
+      expect(result.code).toBe(2);
+      expect(kill).not.toHaveBeenCalled();
+      expect(fetchHealth).not.toHaveBeenCalled();
+    },
+  );
+
+  it('exits 2 when the endpoint cannot be resolved from the environment', async () => {
+    const kill = jest.fn();
+    const fetchHealth = jest.fn<() => Promise<DaemonHealth | null>>();
+    const result = await captureStop([], {
+      endpointFromEnv: () => {
+        throw new Error('invalid KB_DAEMON_PORT: nope');
+      },
+      fetchHealth,
+      kill,
+    });
+    expect(result.code).toBe(2);
+    expect(kill).not.toHaveBeenCalled();
+    expect(fetchHealth).not.toHaveBeenCalled();
+    expect(result.stderr).toContain('invalid KB_DAEMON_PORT');
+  });
+
+  it('keeps polling after a transient probe error, then reports the stop', async () => {
+    let clock = 0;
+    const sleeps: number[] = [];
+    const fetchHealth = jest.fn<() => Promise<DaemonHealth | null>>()
+      .mockResolvedValueOnce(healthy) // preflight
+      .mockRejectedValueOnce(new Error('daemon /health returned a non-object payload')) // transient
+      .mockResolvedValueOnce(null); // gone
+    const result = await captureStop([], {
+      fetchHealth,
+      kill: jest.fn(),
+      isPidAlive: () => true,
+      now: () => clock,
+      sleep: async (ms: number) => {
+        sleeps.push(ms);
+        clock += ms;
+      },
+      timeoutMs: 5000,
+      pollIntervalMs: 100,
+    });
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain('stopped daemon (pid 4242)');
+    // One sleep between the transient failure and the poll that saw it gone.
+    expect(sleeps).toEqual([100]);
+  });
+
+  it('emits the stop envelope even when --json and --quiet are combined', async () => {
+    const fetchHealth = jest.fn<() => Promise<DaemonHealth | null>>()
+      .mockResolvedValueOnce(healthy)
+      .mockResolvedValueOnce(null);
+    const result = await captureStop(['--json'], {
+      fetchHealth,
+      kill: jest.fn(),
+      isPidAlive: () => true,
+    }, 'quiet');
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({
+      stopped: true,
+      pid: 4242,
+      url: localEndpoint.url.href,
+    });
+  });
+});
+
+describe('kb serve stop end-to-end against a real daemon (issue #1134)', () => {
+  const originalSocket = process.env.KB_DAEMON_SOCKET;
+  const originalUrl = process.env.KB_DAEMON_URL;
+
+  afterEach(() => {
+    if (originalSocket === undefined) delete process.env.KB_DAEMON_SOCKET;
+    else process.env.KB_DAEMON_SOCKET = originalSocket;
+    if (originalUrl === undefined) delete process.env.KB_DAEMON_URL;
+    else process.env.KB_DAEMON_URL = originalUrl;
+  });
+
+  it('SIGTERM-drains a spawned daemon so /health becomes unreachable', async () => {
+    const cliPath = path.join(process.cwd(), 'build', 'cli.js');
+    const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'kb-serve-stop-'));
+    const socketPath = path.join(dir, 'kb.sock');
+    const child = spawn(
+      'node',
+      [cliPath, 'serve', `--socket=${socketPath}`, '--idle-timeout-ms=0', '--quiet'],
+      {
+        env: { PATH: process.env.PATH ?? '', KB_LOG_FORMAT: 'text', KB_DAEMON_SOCKET: socketPath },
+        stdio: 'ignore',
+      },
+    );
+    child.on('error', () => undefined);
+    // Record how the child actually terminated so we can prove it exited on its
+    // own (graceful SIGTERM drain), not because the test force-killed it.
+    const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+      child.once('exit', (code, signal) => resolve({ code, signal }));
+    });
+
+    // A stopped daemon unlinks its Unix socket, so a probe then fails with
+    // ENOENT; treat that (like a refused connection) as "not reachable".
+    const probe = async (): Promise<DaemonHealth | null> => {
+      try {
+        return await tryFetchDaemonHealth({ env: process.env });
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return null;
+        throw err;
+      }
+    };
+
+    delete process.env.KB_DAEMON_URL;
+    process.env.KB_DAEMON_SOCKET = socketPath;
+    try {
+      // Wait for the daemon to come up and answer /health over the socket.
+      const ready = await waitFor(async () => (await probe()) !== null, 10_000);
+      expect(ready).toBe(true);
+
+      const code = await runServeStop([], 'quiet');
+      expect(code).toBe(0);
+
+      // Acceptance: /health is unreachable after a graceful stop.
+      expect(await probe()).toBeNull();
+
+      // The daemon drained and exited of its own accord on SIGTERM — `kb serve`
+      // returns 0 on a clean stop, and it unlinks its socket on the way out. A
+      // SIGKILL-style implementation would leave a non-null signal here.
+      const outcome = await exited;
+      expect(outcome).toEqual({ code: 0, signal: null });
+      await expect(fsp.stat(socketPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    } finally {
+      if (child.exitCode === null) child.kill('SIGKILL');
+      await fsp.rm(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it('exits 3 (nothing to stop) when the configured socket has no daemon', async () => {
+    const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'kb-serve-stop-none-'));
+    const socketPath = path.join(dir, 'missing.sock');
+    delete process.env.KB_DAEMON_URL;
+    process.env.KB_DAEMON_SOCKET = socketPath;
+    try {
+      // No injected deps: this drives the real probe, whose ENOENT handling maps
+      // the missing socket to "no daemon" (exit 3) rather than a protocol error.
+      const code = await runServeStop([], 'quiet');
+      expect(code).toBe(3);
+    } finally {
+      await fsp.rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('kb serve dispatch (issue #1134)', () => {
+  it('routes `serve stop` through runServe and honours its arg parsing', async () => {
+    const originalErr = process.stderr.write;
+    process.stderr.write = (() => true) as typeof process.stderr.write;
+    try {
+      // An unknown `stop` flag exits 2 — proof the dispatch reached runServeStop
+      // (and did not fall through to the daemon-start path).
+      const code = await runServe(['stop', '--definitely-not-a-flag']);
+      expect(code).toBe(2);
+    } finally {
+      process.stderr.write = originalErr;
+    }
+  });
+});
+
+async function waitFor(
+  predicate: () => Promise<boolean>,
+  timeoutMs: number,
+  intervalMs = 100,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await predicate()) return true;
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  return false;
+}

@@ -117,7 +117,7 @@ REPO="${REPO:-$HOME/workspace/knowledge-base-mcp-server}"
 
 # --- preflight 2: service loaded + running ---------------------------------
 launchctl print "gui/$(id -u)/${LABEL}" >/dev/null 2>&1 \
-  || die "service '${LABEL}' not loaded — set it up first (see FORK-NOTES.md §Local MCP server)"
+  || die "service '${LABEL}' not loaded — set up a launchd HTTP agent first (see plugins/swiftbar/README.md)"
 state="$(launchctl print "gui/$(id -u)/${LABEL}" | awk -F' = ' '$1 ~ /state/ {print $2; exit}')"
 [[ "$state" == "running" ]] \
   || die "service loaded but state='${state:-unknown}' — start it: launchctl kickstart -k gui/$(id -u)/${LABEL}"

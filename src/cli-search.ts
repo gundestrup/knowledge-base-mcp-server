@@ -40,7 +40,7 @@ import {
   type RetrievalSnippetOptions,
   type ScoredDocument,
 } from './formatter.js';
-import { runPicker } from './cli-search-picker.js';
+import { helpBodyLines, runPicker } from './cli-search-picker.js';
 import { parseColorMode, resolveColorEnabled, type ColorMode } from './color.js';
 import { listKnowledgeBases, resolveKnowledgeBaseDir } from './kb-fs.js';
 import { withWriteLock } from './write-lock.js';
@@ -167,6 +167,12 @@ import {
   parseRecencyFilterRange,
   type SimilaritySearchFilters,
 } from './search-filters.js';
+
+// Keep the interactive-picker key list in the help text — and therefore in the
+// generated CLI reference (docs/reference/cli.md) — sourced from the picker's
+// own helpBodyLines() so the two can never drift. helpBodyLines()[0] is the
+// 'Keys:' label, which the help section heading below replaces.
+const SEARCH_PICKER_KEYS_HELP = helpBodyLines().slice(1).join('\n');
 
 export const SEARCH_HELP = `kb search — semantic search across knowledge bases
 
@@ -335,8 +341,12 @@ Verbosity:
 Input:
   --stdin               Read query from stdin (multi-line safe).
   -i, --interactive     Open an interactive results picker (TTY only; ignored
-                        when a structured or compact format is set).
+                        when a structured or compact format is set). See the
+                        key list below; press ? inside the picker for the same.
   --help, -h            Show this help.
+
+Interactive picker keys (-i, markdown output on a TTY):
+${SEARCH_PICKER_KEYS_HELP}
 
 Examples:
   kb search "rollback procedure"
@@ -827,7 +837,7 @@ export async function runSearch(
   });
 
   if (shouldUsePicker(parsed)) {
-    return runPicker({ results: results as ScoredDocument[] });
+    return runPicker({ results: results as ScoredDocument[], color: shouldColorizePicker(parsed) });
   }
 
   const outputTiming = parsed.timing ? timing : null;
@@ -1372,6 +1382,24 @@ export function shouldHyperlinkSearchOutput(
 
 function buildSearchHyperlinkFlag(parsed: SearchArgs): boolean {
   return shouldHyperlinkSearchOutput(parsed, process.env, process.stdout.isTTY === true);
+}
+
+/**
+ * Issue #1130 — the interactive picker routes its focused-row highlight through
+ * the same unified color resolver (#659) as the rest of search, so the
+ * documented `--color` > `NO_COLOR` > `KB_COLOR` > TTY precedence applies to the
+ * picker frame too (previously it checked only `NO_COLOR`). Like the hyperlink
+ * gate and unlike query-term highlighting, `--highlight` is not a color override
+ * for the picker — only an explicit `--color` flag is. The picker draws its
+ * frames to stderr, so `auto` resolution keys off stderr's TTY.
+ */
+export function shouldColorizePicker(
+  parsed: { color?: ColorMode; colorExplicit?: boolean },
+  env: NodeJS.ProcessEnv = process.env,
+  stderrIsTTY: boolean = process.stderr.isTTY === true,
+): boolean {
+  const flag: ColorMode | undefined = parsed.colorExplicit ? parsed.color ?? 'auto' : undefined;
+  return resolveColorEnabled({ flag, env, isTTY: stderrIsTTY });
 }
 
 function buildSearchSnippetOptions(
@@ -2773,7 +2801,7 @@ async function runLexicalSearch(
   });
 
   if (shouldUsePicker(parsed)) {
-    return runPicker({ results: formatted as ScoredDocument[] });
+    return runPicker({ results: formatted as ScoredDocument[], color: shouldColorizePicker(parsed) });
   }
 
   if (parsed.format === 'json') {
@@ -3187,7 +3215,7 @@ async function runHybridSearch(
   }
 
   if (shouldUsePicker(parsed)) {
-    return runPicker({ results: ranked as ScoredDocument[] });
+    return runPicker({ results: ranked as ScoredDocument[], color: shouldColorizePicker(parsed) });
   }
 
   if (parsed.format === 'json') {

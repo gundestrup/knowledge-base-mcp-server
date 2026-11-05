@@ -189,6 +189,7 @@ export const CONFIG_SCHEMA: readonly ConfigSpec[] = [
   { name: 'KB_PROVIDER_BREAKER_FAILURE_THRESHOLD', kind: 'integer', default: '3', min: 1, max: 100, integerSyntax: 'digits', description: 'Consecutive provider failures before the circuit opens.' },
   { name: 'KB_PROVIDER_BREAKER_COOLDOWN_MS', kind: 'duration', default: '30000', min: 1, max: 3600000, description: 'Open-circuit cooldown before a single half-open recovery probe is allowed.' },
   { name: 'KB_EMBED_TIMEOUT_MS', kind: 'duration', default: '120000', min: 1, description: 'Per-call deadline for network embedding-provider calls; on expiry the call fails with PROVIDER_TIMEOUT and the circuit breaker records it.' },
+  { name: 'KB_READY_TIMEOUT_MS', kind: 'duration', default: '5000', min: 1, description: 'Deadline for the remote transport GET /ready probe; on expiry /ready returns a bounded 503 error payload instead of blocking on a cold/hung embedding backend up to KB_EMBED_TIMEOUT_MS.' },
 
   { name: 'INDEXING_BATCH_SIZE', kind: 'integer', docDefault: '64; 16 when EMBEDDING_PROVIDER=ollama', defaultValue: (env) => String(defaultIndexingBatchSize(effectiveStringValue(env, 'EMBEDDING_PROVIDER', 'huggingface'))), min: 1, max: 512, description: 'Number of chunks embedded per provider request during indexing.' },
   { name: 'KB_INDEXING_CONCURRENCY', kind: 'integer', default: '1', min: 1, max: 4, description: 'Number of embedding batches indexed in parallel.' },
@@ -207,6 +208,8 @@ export const CONFIG_SCHEMA: readonly ConfigSpec[] = [
   { name: 'KB_QUERY_CACHE', kind: 'boolean', default: 'on', booleanValues: QUERY_CACHE_BOOL_VALUES, truthyValues: ['on', 'true', '1', 'yes', 'enabled'], description: 'Enables the query embedding cache.' },
   { name: 'KB_QUERY_CACHE_LRU_MAX', kind: 'integer', default: '256', min: 0, description: 'Maximum query-embedding entries retained in the process LRU; 0 disables the memory tier.' },
   { name: 'KB_QUERY_CACHE_DISK_MAX_MB', kind: 'number', default: '64', min: 0.000001, description: 'Disk-size cap (MiB) for the persistent query-embedding cache.' },
+  { name: 'KB_QUERY_CACHE_SINGLE_FLIGHT', kind: 'boolean', default: 'off', booleanValues: QUERY_CACHE_BOOL_VALUES, truthyValues: ['on', 'true', '1', 'yes', 'enabled'], description: 'Coalesces concurrent identical query-embedding cache misses onto a single in-flight embedding call (single-flight), preventing duplicate embeds under a thundering herd. Opt-in; default-off preserves independent per-miss embedding.' },
+  { name: 'KB_EXTRACTION_CACHE_DISK_MAX_BYTES', kind: 'integer', default: '0', min: 0, description: 'Disk-size cap in bytes for the extracted-text cache under $FAISS_INDEX_PATH/extracted-text; on each write past the cap oldest entries are evicted. 0 (default) disables enforcement, leaving the cache unbounded.' },
 
   { name: 'KB_CONTEXTUAL_RETRIEVAL', kind: 'boolean', default: 'off', booleanValues: YES_NO_BOOL_VALUES, truthyValues: YES_NO_TRUTHY_VALUES, description: 'Enables LLM contextual prefaces during ingest.' },
   { name: 'KB_RETRIEVAL_VIEWS', kind: 'csv', default: '', description: 'Extra per-chunk representations (section, metadata, summary) built and indexed alongside the passage view for multi-view retrieval.' },
@@ -273,6 +276,8 @@ export const CONFIG_SCHEMA: readonly ConfigSpec[] = [
   { name: 'KB_METRICS_EXPORT', kind: 'boolean', default: 'off', booleanValues: YES_NO_BOOL_VALUES, truthyValues: YES_NO_TRUTHY_VALUES, description: 'Exposes the OpenMetrics text endpoint on the loopback HTTP daemon.' },
   { name: 'KB_FLAT_SEARCH_P95_ADVISORY_MS', kind: 'duration', default: String(DEFAULT_FLAT_SEARCH_P95_ADVISORY_MS), min: 1, description: 'Advisory p95 latency bound for flat-index search; kb stats and kb doctor warn when it is exceeded.' },
   { name: 'KB_MUTATION_AUDIT_LOG', kind: 'path', description: 'Path to an append-only log where mutating operations record audit entries.' },
+  { name: 'KB_MUTATION_AUDIT_LOG_MAX_BYTES', kind: 'integer', min: 1, description: 'Enables size-based KB_MUTATION_AUDIT_LOG rotation when set to a positive byte cap; unset keeps the append-forever default.' },
+  { name: 'KB_MUTATION_AUDIT_LOG_MAX_FILES', kind: 'integer', default: '5', min: 1, description: 'Retained rotated KB_MUTATION_AUDIT_LOG generations when KB_MUTATION_AUDIT_LOG_MAX_BYTES enables rotation.' },
   { name: 'KB_AGE_BUDGET_HOURS', kind: 'integer', min: 1, description: 'Global maximum content-age budget (hours) for staleness checks; per-KB overrides use KB_AGE_BUDGET_HOURS_<KB>.' },
 
   { name: 'KB_DAEMON_URL', kind: 'url', protocols: ['http:', 'https:'], description: 'Explicit daemon HTTP URL for clients; takes precedence over host/port/socket resolution.' },

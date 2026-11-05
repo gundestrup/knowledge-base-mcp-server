@@ -8,6 +8,10 @@ const initializeMock = jest.fn();
 const updateIndexMock = jest.fn();
 const reloadPersistedIndexMock = jest.fn();
 const similaritySearchMock = jest.fn();
+// Issue #1133 — find_related resolves a seed chunk via findChunkByReference,
+// then runs similaritySearch on the seed text. Default to "no seed found" so
+// tests that don't exercise find_related are unaffected.
+const findChunkByReferenceMock = jest.fn((..._args: unknown[]) => null as unknown);
 const expandWithNeighborContextMock = jest.fn((results: unknown) => results);
 const hasLoadedIndexMock = jest.fn(() => true);
 // Issue #54 — kb_stats reads chunk_count + dim from the manager. Default to
@@ -51,6 +55,7 @@ const FaissIndexManagerMock: any = jest.fn().mockImplementation((opts?: { provid
     updateIndex: updateIndexMock,
     reloadPersistedIndex: reloadPersistedIndexMock,
     similaritySearch: similaritySearchMock,
+    findChunkByReference: findChunkByReferenceMock,
     expandWithNeighborContext: expandWithNeighborContextMock,
     getStats: getStatsMock,
     getLastIndexUpdateSummary: getLastIndexUpdateSummaryMock,
@@ -108,6 +113,8 @@ describe('KnowledgeBaseServer handlers', () => {
     updateIndexMock.mockReset();
     reloadPersistedIndexMock.mockReset();
     similaritySearchMock.mockReset();
+    findChunkByReferenceMock.mockReset();
+    findChunkByReferenceMock.mockReturnValue(null);
     expandWithNeighborContextMock.mockReset();
     expandWithNeighborContextMock.mockImplementation((results: unknown) => results);
     hasLoadedIndexMock.mockReset();
@@ -409,6 +416,105 @@ describe('KnowledgeBaseServer handlers', () => {
     const server = await freshServer();
     const result = await server['handleRetrieveKnowledge']({ query: 'q' });
     expect(result.content[0].text).not.toContain('Model:');
+  });
+
+  // --- Issue #975: named subset of shelves (knowledge_base_names) ------------
+
+  async function seedKbs(tempDir: string, names: string[]): Promise<void> {
+    for (const name of names) {
+      await fsp.mkdir(path.join(tempDir, name), { recursive: true });
+      await fsp.writeFile(path.join(tempDir, name, 'd.md'), 'data');
+    }
+  }
+
+  it('handleRetrieveKnowledge with knowledge_base_names scopes the dense leg to the subset (#975)', async () => {
+    const tempDir = await setRetrieveEnv();
+    await seedKbs(tempDir, ['alpha', 'beta', 'gamma']);
+    updateIndexMock.mockResolvedValue(undefined);
+    similaritySearchMock.mockResolvedValue([
+      { pageContent: 'hit', metadata: { source: path.join(tempDir, 'alpha', 'd.md') }, score: 0.5 },
+    ]);
+
+    const server = await freshServer();
+    const result = await server['handleRetrieveKnowledge']({
+      query: 'q',
+      knowledge_base_names: ['alpha', 'beta'],
+    });
+
+    expect(result.isError).toBeUndefined();
+    // The dense leg gets the subset via opts; the single-KB positional stays
+    // undefined so the two scope inputs never mix.
+    const call = similaritySearchMock.mock.calls[0];
+    expect(call[3]).toBeUndefined();
+    expect(call[6]?.knowledgeBaseNames).toEqual(['alpha', 'beta']);
+    // Only the named KBs are refreshed under the write lock — gamma is not.
+    expect(updateIndexMock.mock.calls.map((c: unknown[]) => c[0])).toEqual(['alpha', 'beta']);
+  });
+
+  it('handleRetrieveKnowledge without a subset keeps the all-KB default scope (#975)', async () => {
+    await setRetrieveEnv();
+    updateIndexMock.mockResolvedValue(undefined);
+    similaritySearchMock.mockResolvedValue([
+      { pageContent: 'hello', metadata: { source: '/tmp/x.md' }, score: 0.5 },
+    ]);
+
+    const server = await freshServer();
+    const result = await server['handleRetrieveKnowledge']({ query: 'q' });
+
+    expect(result.isError).toBeUndefined();
+    const call = similaritySearchMock.mock.calls[0];
+    expect(call[3]).toBeUndefined();
+    expect(call[6]?.knowledgeBaseNames).toBeUndefined();
+    // The whole corpus is refreshed with a single undefined-scoped updateIndex.
+    expect(updateIndexMock.mock.calls).toEqual([[undefined]]);
+  });
+
+  it('handleRetrieveKnowledge rejects knowledge_base_name + knowledge_base_names with VALIDATION (#975)', async () => {
+    const tempDir = await setRetrieveEnv();
+    await seedKbs(tempDir, ['alpha']);
+
+    const server = await freshServer();
+    const result = await server['handleRetrieveKnowledge']({
+      query: 'q',
+      knowledge_base_name: 'alpha',
+      knowledge_base_names: ['alpha'],
+    });
+
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0].text).error.code).toBe('VALIDATION');
+    expect(similaritySearchMock).not.toHaveBeenCalled();
+  });
+
+  it('handleRetrieveKnowledge fails closed with KB_NOT_FOUND for an unknown name in the subset (#975)', async () => {
+    const tempDir = await setRetrieveEnv();
+    await seedKbs(tempDir, ['alpha']);
+
+    const server = await freshServer();
+    const result = await server['handleRetrieveKnowledge']({
+      query: 'q',
+      knowledge_base_names: ['alpha', 'doesnotexist'],
+    });
+
+    expect(result.isError).toBe(true);
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.error.code).toBe('KB_NOT_FOUND');
+    expect(payload.error.message).toContain('doesnotexist');
+    expect(similaritySearchMock).not.toHaveBeenCalled();
+  });
+
+  it('handleAskKnowledge rejects knowledge_base_name + knowledge_base_names with VALIDATION (#975)', async () => {
+    const tempDir = await setRetrieveEnv();
+    await seedKbs(tempDir, ['alpha']);
+
+    const server = await freshServer();
+    const result = await server['handleAskKnowledge']({
+      query: 'q',
+      knowledge_base_name: 'alpha',
+      knowledge_base_names: ['alpha'],
+    });
+
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0].text).error.code).toBe('VALIDATION');
   });
 
   it('handleRetrieveKnowledge expands neighbor context only when requested', async () => {
@@ -1519,6 +1625,251 @@ describe('KnowledgeBaseServer handlers', () => {
     expect(uris.join('\n')).not.toContain('.index');
     expect(uris.join('\n')).not.toContain('.reindex-trigger');
     expect(uris.join('\n')).not.toContain('.hidden');
+  });
+
+  // --- handleFindRelated (#1133) --------------------------------------------
+
+  it('handleFindRelated resolves a seed chunk id and returns semantically similar chunks (excluding the seed)', async () => {
+    await setRetrieveEnv();
+    const seed = {
+      pageContent: 'deploy rollback seed text',
+      metadata: {
+        knowledgeBase: 'alpha',
+        relativePath: 'alpha/docs/deploy.md',
+        loc: { lines: { from: 1, to: 4 } },
+        chunkIndex: 0,
+      },
+    };
+    findChunkByReferenceMock.mockReturnValue(seed);
+    // similaritySearch returns the seed itself (dropped by default) plus a
+    // genuinely related chunk that must survive into the response.
+    similaritySearchMock.mockResolvedValue([
+      { ...seed, score: 0.01 },
+      {
+        pageContent: 'adjacent deploy note',
+        metadata: {
+          knowledgeBase: 'alpha',
+          relativePath: 'alpha/docs/other.md',
+          loc: { lines: { from: 9, to: 12 } },
+          chunkIndex: 0,
+        },
+        score: 0.42,
+      },
+    ]);
+
+    const server = await freshServer();
+    const result = await server['handleFindRelated']({
+      chunk_id: 'alpha/docs/deploy.md#L1-L4',
+      k: 1,
+    });
+
+    expect(result.isError).toBeUndefined();
+    // The seed reference was parsed and resolved against the loaded index.
+    expect(findChunkByReferenceMock).toHaveBeenCalledWith(expect.objectContaining({
+      knowledgeBase: 'alpha',
+      kbRelativePath: 'docs/deploy.md',
+      lineFrom: 1,
+      lineTo: 4,
+    }));
+    // The search runs on the seed's own text, scoped to the seed KB by default,
+    // and over-fetches by one (k + 1) so the excluded seed leaves k results.
+    expect(similaritySearchMock).toHaveBeenCalledWith(
+      'deploy rollback seed text',
+      2,
+      2,
+      'alpha',
+      undefined,
+      expect.any(Object),
+      { noCache: false },
+    );
+    const payload = JSON.parse(result.content[0].text) as {
+      schema_version: string;
+      seed: { chunk_id: string };
+      scoped_kb: string;
+      include_self: boolean;
+      results: Array<{ chunk_id: string; content: string }>;
+    };
+    expect(payload.schema_version).toBe('kb.related.v1');
+    expect(payload.seed.chunk_id).toBe('alpha/docs/deploy.md#L1-L4');
+    expect(payload.scoped_kb).toBe('alpha');
+    expect(payload.include_self).toBe(false);
+    expect(payload.results).toEqual([
+      expect.objectContaining({
+        chunk_id: 'alpha/docs/other.md#L9-L12',
+        content: 'adjacent deploy note',
+      }),
+    ]);
+  });
+
+  it('handleFindRelated returns KB_NOT_FOUND when no indexed chunk matches the seed', async () => {
+    await setRetrieveEnv();
+    findChunkByReferenceMock.mockReturnValue(null);
+
+    const server = await freshServer();
+    const result = await server['handleFindRelated']({
+      chunk_id: 'kb://alpha/docs/deploy.md#L1-L4',
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('KB_NOT_FOUND');
+    expect(result.content[0].text).toContain("no indexed chunk matched 'kb://alpha/docs/deploy.md#L1-L4'");
+    expect(similaritySearchMock).not.toHaveBeenCalled();
+  });
+
+  it('handleFindRelated rejects a bare <kb>/<path> location with VALIDATION (not a single chunk)', async () => {
+    await setRetrieveEnv();
+
+    const server = await freshServer();
+    const result = await server['handleFindRelated']({ chunk_id: 'alpha/docs/deploy.md' });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('VALIDATION');
+    expect(findChunkByReferenceMock).not.toHaveBeenCalled();
+  });
+
+  it('handleFindRelated rejects knowledge_base_name + all_kbs with VALIDATION', async () => {
+    await setRetrieveEnv();
+
+    const server = await freshServer();
+    const result = await server['handleFindRelated']({
+      chunk_id: 'alpha/docs/deploy.md#L1-L4',
+      knowledge_base_name: 'alpha',
+      all_kbs: true,
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('VALIDATION');
+    expect(findChunkByReferenceMock).not.toHaveBeenCalled();
+  });
+
+  it('handleFindRelated with all_kbs searches every KB (undefined scope) and include_self keeps the seed', async () => {
+    await setRetrieveEnv();
+    const seed = {
+      pageContent: 'seed body',
+      metadata: {
+        knowledgeBase: 'alpha',
+        relativePath: 'alpha/docs/deploy.md',
+        loc: { lines: { from: 1, to: 4 } },
+        chunkIndex: 0,
+      },
+    };
+    findChunkByReferenceMock.mockReturnValue(seed);
+    similaritySearchMock.mockResolvedValue([{ ...seed, score: 0.0 }]);
+
+    const server = await freshServer();
+    const result = await server['handleFindRelated']({
+      chunk_id: 'alpha/docs/deploy.md#L1-L4',
+      all_kbs: true,
+      include_self: true,
+      k: 5,
+    });
+
+    expect(result.isError).toBeUndefined();
+    // include_self=true → fetchK equals k (no over-fetch), scope undefined (all KBs).
+    expect(similaritySearchMock).toHaveBeenCalledWith(
+      'seed body',
+      5,
+      2,
+      undefined,
+      undefined,
+      expect.any(Object),
+      { noCache: false },
+    );
+    const payload = JSON.parse(result.content[0].text) as {
+      scoped_kb: string | null;
+      include_self: boolean;
+      results: unknown[];
+    };
+    expect(payload.scoped_kb).toBeNull();
+    expect(payload.include_self).toBe(true);
+    // The seed survives in the results when include_self is set.
+    expect(payload.results).toHaveLength(1);
+  });
+
+  it('handleFindRelated scopes to an explicit knowledge_base_name different from the seed KB', async () => {
+    await setRetrieveEnv();
+    const seed = {
+      pageContent: 'seed body',
+      metadata: {
+        knowledgeBase: 'alpha',
+        relativePath: 'alpha/docs/deploy.md',
+        loc: { lines: { from: 1, to: 4 } },
+        chunkIndex: 0,
+      },
+    };
+    findChunkByReferenceMock.mockReturnValue(seed);
+    similaritySearchMock.mockResolvedValue([
+      {
+        pageContent: 'beta note',
+        metadata: {
+          knowledgeBase: 'beta',
+          relativePath: 'beta/docs/note.md',
+          loc: { lines: { from: 2, to: 5 } },
+          chunkIndex: 0,
+        },
+        score: 0.3,
+      },
+    ]);
+
+    const server = await freshServer();
+    const result = await server['handleFindRelated']({
+      chunk_id: 'alpha/docs/deploy.md#L1-L4',
+      knowledge_base_name: 'beta',
+      k: 1,
+    });
+
+    expect(result.isError).toBeUndefined();
+    // The explicit KB overrides the seed KB default: the search is scoped to
+    // 'beta', not the seed's 'alpha'. Guards against a regression that drops
+    // options.kb and always uses reference.knowledgeBase.
+    expect(similaritySearchMock).toHaveBeenCalledWith(
+      'seed body',
+      2,
+      2,
+      'beta',
+      undefined,
+      expect.any(Object),
+      { noCache: false },
+    );
+    const payload = JSON.parse(result.content[0].text) as { scoped_kb: string | null };
+    expect(payload.scoped_kb).toBe('beta');
+  });
+
+  it('handleFindRelated treats an empty/whitespace knowledge_base_name as the seed-KB default', async () => {
+    await setRetrieveEnv();
+    const seed = {
+      pageContent: 'seed body',
+      metadata: {
+        knowledgeBase: 'alpha',
+        relativePath: 'alpha/docs/deploy.md',
+        loc: { lines: { from: 1, to: 4 } },
+        chunkIndex: 0,
+      },
+    };
+    findChunkByReferenceMock.mockReturnValue(seed);
+    similaritySearchMock.mockResolvedValue([]);
+
+    const server = await freshServer();
+    const result = await server['handleFindRelated']({
+      chunk_id: 'alpha/docs/deploy.md#L1-L4',
+      knowledge_base_name: '   ',
+      k: 3,
+    });
+
+    expect(result.isError).toBeUndefined();
+    // "   " is normalized to "unset" → scope falls back to the seed KB 'alpha',
+    // never a literal KB named "   " (which would silently return nothing).
+    expect(similaritySearchMock).toHaveBeenCalledWith(
+      'seed body',
+      4,
+      2,
+      'alpha',
+      undefined,
+      expect.any(Object),
+      { noCache: false },
+    );
+    const payload = JSON.parse(result.content[0].text) as { scoped_kb: string | null };
+    expect(payload.scoped_kb).toBe('alpha');
   });
 
   // --- handleRetrieveKnowledge ----------------------------------------------
@@ -2888,15 +3239,15 @@ describe('KnowledgeBaseServer handlers', () => {
   }
 
   // Issue #798 — every tool must advertise its advisory ToolAnnotations so MCP
-  // clients can gate auto-approval and confirm destructive writes. The six
+  // clients can gate auto-approval and confirm destructive writes. The seven
   // readers are read-only; the three ingest-gated writes carry hand-reviewed
   // destructive/idempotent hints (delete is the only destructive one).
-  it('registers each of the 9 tools with the expected ToolAnnotations hints', async () => {
+  it('registers each of the 10 tools with the expected ToolAnnotations hints', async () => {
     await setRetrieveEnv();
     process.env.KB_INGEST_ENABLED = 'true';
     const server = await freshServer();
 
-    // All 9 tools present so we can assert the writes too.
+    // All 10 tools present so we can assert the writes too.
     expect(registeredToolNames(server)).toEqual(
       expect.arrayContaining([
         'list_knowledge_bases',
@@ -2905,6 +3256,7 @@ describe('KnowledgeBaseServer handlers', () => {
         'list_models',
         'kb_stats',
         'diff_index',
+        'find_related',
         'add_document',
         'delete_document',
         'reindex_knowledge_base',
@@ -2918,6 +3270,7 @@ describe('KnowledgeBaseServer handlers', () => {
       'list_models',
       'kb_stats',
       'diff_index',
+      'find_related',
     ]) {
       expect(annotationsOf(server, readOnlyTool)).toMatchObject({ readOnlyHint: true });
     }

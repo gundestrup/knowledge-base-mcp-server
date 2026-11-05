@@ -21,7 +21,7 @@ The `kb` CLI exposes 40 commands.
 | [`kb capture`](#kb-capture) | Run a command and append its stdout to a KB note as a fenced block. |
 | [`kb cite`](#kb-cite) | Export BibTeX or CSL-JSON from note frontmatter. |
 | [`kb compare`](#kb-compare) | Side-by-side rank/score table for two embedding models. |
-| [`kb completion`](#kb-completion) | Generate shell completions for bash, zsh, or fish. |
+| [`kb completion`](#kb-completion) | Generate shell completions for bash, zsh, fish, or powershell. |
 | [`kb config`](#kb-config) | Validate KB environment configuration. |
 | [`kb diagnose`](#kb-diagnose) | Package a canonical request log as a redacted repro bundle. |
 | [`kb diff-index`](#kb-diff-index) | Compare retrieval-result churn across two FAISS index versions. |
@@ -304,7 +304,7 @@ Examples:
 
 ## `kb completion`
 
-Generate shell completions for bash, zsh, or fish.
+Generate shell completions for bash, zsh, fish, or powershell.
 
 ```text
 kb completion — generate shell completion scripts
@@ -313,11 +313,13 @@ Usage:
   kb completion bash
   kb completion zsh
   kb completion fish
+  kb completion powershell
 
 Shells:
   bash                  Print a bash completion function for the `kb` command.
   zsh                   Print a zsh completion function for the `kb` command.
   fish                  Print fish completion commands for the `kb` command.
+  powershell            Print a PowerShell Register-ArgumentCompleter script for the `kb` command.
 
 Options:
   --help, -h            Show this help.
@@ -326,6 +328,7 @@ Examples:
   kb completion bash > ~/.local/share/bash-completion/completions/kb
   kb completion zsh > ~/.zfunc/_kb
   kb completion fish > ~/.config/fish/completions/kb.fish
+  kb completion powershell >> $PROFILE
 ```
 
 ## `kb config`
@@ -368,11 +371,20 @@ kb diagnose — package a canonical request log as a repro bundle
 
 Usage:
   kb diagnose --request-id=<id> --repro-bundle=<dir> [--file=<path>] [--query=<text>|--query-file=<path>|--stdin] [--include-content] [--force] [--format=md|json]
+  kb diagnose --to-fixture=<bundle-dir> --out=<fixture-dir> [--include-sources] [--force] [--format=md|json]
 
 Reads canonical logs for one request id and writes a private diagnostic bundle
 with redacted log context. When the raw query is supplied, it also replays
 `kb explain --repro-bundle` using model, KB scope, k, and threshold hints from
 the selected canonical event when available.
+
+`--to-fixture` turns an existing diagnose bundle into a runnable local
+retrieval fixture (issue #977). It reads the bundle's replayed query and hits
+and writes a `kb eval` fixture plus a redacted mini-corpus that `kb eval` can
+run offline with fake (deterministic, no-network) embeddings — no real
+embedding provider is ever called. The mini-corpus is a redacted stand-in built
+from the bundle; original note bodies are NOT rehydrated from disk unless you
+pass `--include-sources`. The generated `README.md` lists the exact commands.
 
 Options:
   --request-id=<id>       Canonical request id to package.
@@ -385,13 +397,22 @@ Options:
   --stdin                 Read the raw query from stdin.
   --include-content       Forward to kb explain; includes candidate chunk text.
                           Requires a raw query.
-  --force                 Chmod unsafe existing bundle directories to 0700.
+  --to-fixture=<dir>      Read an existing diagnose bundle at <dir> and scaffold
+                          a runnable retrieval-eval fixture from it. Requires
+                          --out=<fixture-dir>.
+  --out=<dir>             Output directory for the scaffolded fixture. Only
+                          valid with --to-fixture.
+  --include-sources       Only with --to-fixture: rehydrate note bodies from the
+                          live knowledge base on disk (redacted) instead of the
+                          redacted stand-in corpus. Default is off.
+  --force                 Chmod unsafe existing output directories to 0700.
   --format=md|json        Output format (default: md).
   --help, -h              Show this help.
 
 Examples:
   kb diagnose --request-id=maw6d3qfabcd1234 --repro-bundle=/tmp/kb-diag
   kb diagnose --request-id=maw6d3qfabcd1234 --query-file=query.txt --repro-bundle=/tmp/kb-diag
+  kb diagnose --to-fixture=/tmp/kb-diag --out=/tmp/kb-fixture
 ```
 
 ## `kb diff-index`
@@ -1678,8 +1699,23 @@ Verbosity:
 Input:
   --stdin               Read query from stdin (multi-line safe).
   -i, --interactive     Open an interactive results picker (TTY only; ignored
-                        when a structured or compact format is set).
+                        when a structured or compact format is set). See the
+                        key list below; press ? inside the picker for the same.
   --help, -h            Show this help.
+
+Interactive picker keys (-i, markdown output on a TTY):
+  j / Down     next result
+  k / Up       previous result
+  PgDn / PgUp  page down / up
+  Ctrl-D/Ctrl-U  half page down / up
+  g            jump to top
+  G            jump to bottom
+  /            filter results (type to narrow, Esc clears, Enter selects)
+  Space        mark / unmark focused chunk in flat view
+  Tab          toggle flat / grouped-by-source view
+  Enter        print marked chunks, or focused row/source if none are marked
+  ?            toggle this help
+  q / Esc      quit (no output)
 
 Examples:
   kb search "rollback procedure"
@@ -1707,6 +1743,7 @@ kb serve — resident local daemon for warm CLI reads
 Usage:
   kb serve [--host=127.0.0.1] [--port=17799] [--socket=/path/to/kb.sock] [--idle-timeout-ms=300000] [--warm]
   kb serve status [--json]
+  kb serve stop [--json]
 
 Starts a local JSON HTTP daemon used by `kb search --daemon`.
 The daemon accepts read-only search/list/stats requests and exits after the
@@ -1714,9 +1751,17 @@ idle timeout.
 
 `kb serve status` reports whether a daemon is reachable at the configured
 URL along with its PID, idle timeout, supported commands, uptime, and the
-build (version + commit) it is serving. It never starts or stops a daemon.
-When `kb search --daemon` cannot reach a daemon it prints a one-line notice
-to stderr and runs the search directly.
+build (version + commit) it is serving. `kb serve status` itself never starts
+or stops a daemon; use `kb serve stop` to stop one. When `kb search --daemon`
+cannot reach a daemon it prints a one-line notice to stderr and runs the search
+directly.
+
+`kb serve stop` gracefully stops the daemon reachable at the configured URL:
+it reads the PID from `GET /health`, sends SIGTERM (triggering the daemon's
+graceful drain), and polls `/health` until the daemon stops answering. It
+signals only a daemon reachable over loopback or a Unix-domain socket, and only
+when the reported PID is a live local process; a non-loopback URL is refused
+(exit 2). If no daemon is running it reports that and exits 3.
 
 Options:
   --host=<host>             Loopback host to bind (default: 127.0.0.1).
@@ -1725,7 +1770,8 @@ Options:
   --idle-timeout-ms=<ms>    Stop after this much idle time (default: 300000).
   --warm                    Pre-warm the active model, FAISS index, and
                             lexical indexes before the daemon reports ready.
-  --json                    `kb serve status`: emit the daemon health JSON.
+  --json                    `kb serve status`: emit the daemon health JSON;
+                            `kb serve stop`: emit the stop-result JSON.
   --quiet, -q               Suppress the "listening on" line (and the `status`
                             "start one with" hint), leaving only errors.
   --verbose, -v             Reserved for extra diagnostics.
@@ -1748,10 +1794,14 @@ Environment:
                             as `kb serve --warm`.
 
 Exit codes:
-  0   daemon started, or `kb serve status` found a reachable daemon
-  1   runtime error
-  2   invalid arguments or environment
-  3   `kb serve status`: no daemon reachable at the configured URL
+  0   daemon started, `kb serve status` found a reachable daemon, or
+      `kb serve stop` stopped the running daemon
+  1   runtime error (includes `kb serve stop` failing to signal or confirm
+      shutdown of the daemon)
+  2   invalid arguments or environment (includes `kb serve stop` refusing a
+      non-local daemon URL)
+  3   `kb serve status`/`kb serve stop`: no daemon reachable at the
+      configured URL (for `stop`, nothing to stop)
 ```
 
 ## `kb stale-check`

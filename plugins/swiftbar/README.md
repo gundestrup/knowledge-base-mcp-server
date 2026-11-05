@@ -1,17 +1,26 @@
 # plugins/ — macOS menu-bar control for the local MCP server
 
-Fork-local tooling (listed in `FORK-ONLY`; never goes to upstream PRs).
 A [SwiftBar](https://swiftbar.app) plugin that puts a status icon in the
-macOS menu bar for the launchd-managed `knowledge-base-mcp-server`
-(`ai.knowledge-base.mcp`, `MCP_TRANSPORT=http`).
+macOS menu bar for a locally hosted `knowledge-base-mcp-server` running
+streamable HTTP under launchd (example label: `ai.knowledge-base.mcp`,
+`MCP_TRANSPORT=http`, bearer auth via `MCP_AUTH_TOKEN_FILE`).
 
 ## Requires
 
 - macOS + SwiftBar (`brew install --cask swiftbar`, or run the installer
   with `--install-swiftbar` and it will install it via Homebrew for you)
-- The launchd HTTP server already installed, loaded, and healthy
-  (see `FORK-NOTES.md` §Local MCP server — the installer refuses to run
-  otherwise)
+- The server already running as a launchd HTTP agent, loaded and healthy —
+  the installer refuses to install otherwise. Minimal plist:
+
+      <key>ProgramArguments</key>
+      <array><string>/opt/homebrew/bin/node</string>
+            <string>/path/to/repo/build/index.js</string></array>
+      <key>EnvironmentVariables</key>
+      <dict><key>MCP_TRANSPORT</key><string>http</string>
+            <key>MCP_PORT</key><string>8090</string>
+            <key>MCP_BIND_ADDR</key><string>127.0.0.1</string>
+            <key>MCP_AUTH_TOKEN_FILE</key>
+            <string>~/.config/kb/mcp-auth-token</string></dict>
 - `node` (used to resolve config; already a server dependency)
 
 ## Install / uninstall
@@ -60,7 +69,7 @@ deleting just its own files if the checkout is gone).
 ## Testing
 
 ```bash
-plugins/swiftbar/test.sh    # 19 checks: reject paths, happy path, uninstall
+plugins/swiftbar/test.sh    # reject paths, happy path, uninstall, update + release-tag pinning
 ```
 
 Uses `KB_PLUGIN_DST`/`KB_MENUBAR_ENV`/`KB_SWIFTBAR_APP`/`KB_MCP_LABEL`/

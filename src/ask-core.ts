@@ -1,5 +1,6 @@
-import type { FaissIndexManager, SimilaritySearchTiming } from './FaissIndexManager.js';
+import type { FaissIndexManager, NeighborContextOptions, SimilaritySearchTiming } from './FaissIndexManager.js';
 import type { SearchResultDocument } from './FaissIndexManager.js';
+import { parseRecencyFilterRange, type SimilaritySearchFilters } from './search-filters.js';
 import type { resolveActiveModel } from './model-resolution.js';
 import { resolveLlmProvider } from './config/llm-provider.js';
 import {
@@ -115,6 +116,8 @@ export const ASK_SYSTEM_PROMPT =
 export interface AskExecutionArgs {
   question: string;
   kb?: string;
+  /** Issue #975 — named subset scope (mutually exclusive with `kb`). */
+  kbs?: readonly string[];
   model?: string;
   llmProfile?: string;
   endpoint?: string;
@@ -128,6 +131,18 @@ export interface AskExecutionArgs {
   gate?: RelevanceGateOverride;
   /** Retrieval mode. Defaults to {@link DEFAULT_ASK_SEARCH_MODE} ('auto'). */
   searchMode?: SearchMode;
+  /**
+   * Issue #974 — optional metadata POST-filters (extension / path glob / tags /
+   * recency) applied to retrieved evidence before context packing, mirroring
+   * `retrieve_knowledge`. `undefined` (the default) searches the whole base.
+   */
+  filters?: SimilaritySearchFilters;
+  /**
+   * Issue #974 — opt-in neighbor-window expansion around each dense match.
+   * `undefined`/0 leaves hits unexpanded. Only valid with dense retrieval;
+   * {@link askKnowledge} rejects it for an effective hybrid/lexical mode.
+   */
+  neighborContext?: NeighborContextOptions;
   /** Per-call cross-encoder reranker override (hybrid only). Off by default. */
   rerank?: RerankOverride;
   onAnswerToken?: (token: string) => void | Promise<void>;
@@ -141,6 +156,8 @@ export interface AskExecutionArgs {
 export interface AskKnowledgeInput {
   query: string;
   knowledge_base_name?: string;
+  /** Issue #975 — named subset scope (mutually exclusive with knowledge_base_name). */
+  knowledge_base_names?: readonly string[];
   model_name?: string;
   llm_profile?: string;
   endpoint?: string;
@@ -150,6 +167,16 @@ export interface AskKnowledgeInput {
   timing?: boolean;
   task_context?: string;
   gate?: RelevanceGateOverride;
+  /** Issue #974 — metadata POST-filters scoping the retrieved evidence. */
+  extensions?: readonly string[];
+  path_glob?: string;
+  tags?: readonly string[];
+  since?: string;
+  until?: string;
+  /** Issue #974 — opt-in neighbor windows (dense retrieval only). */
+  context_before?: number;
+  context_after?: number;
+  context_window?: number;
   /** Retrieval mode. Defaults to {@link DEFAULT_ASK_SEARCH_MODE} ('auto'). */
   search_mode?: SearchMode;
   /** Per-call cross-encoder reranker override (hybrid only). Off by default. */
@@ -287,6 +314,18 @@ export class AskExecutionError extends Error {
   }
 }
 
+/**
+ * Issue #975 — a single KB-scope label for spans, observability, and the
+ * retrieval payload: the scalar `kb`, else the comma-joined subset, else null
+ * (all KBs). With no subset requested this is identical to the pre-#975
+ * `args.kb ?? null`.
+ */
+function askScopeLabel(args: AskExecutionArgs): string | null {
+  if (args.kb !== undefined && args.kb.length > 0) return args.kb;
+  if (args.kbs !== undefined && args.kbs.length > 0) return args.kbs.join(',');
+  return null;
+}
+
 export async function askKnowledge(
   input: AskKnowledgeInput,
   deps: RunAskCoreDeps,
@@ -300,9 +339,35 @@ export async function askKnowledge(
   if (!Number.isInteger(contextBudgetTokens) || contextBudgetTokens < MIN_ASK_CONTEXT_BUDGET_TOKENS) {
     throw new Error(`ask_knowledge requires context_budget_tokens >= ${MIN_ASK_CONTEXT_BUDGET_TOKENS}`);
   }
+  const kbs = input.knowledge_base_names !== undefined && input.knowledge_base_names.length > 0
+    ? input.knowledge_base_names
+    : undefined;
+  // Issue #974 — validate the recency bounds up front so a malformed `since`/
+  // `until` fails with a clean message before any retrieval work (mirrors
+  // retrieve_knowledge's early parseRecencyFilterRange guard).
+  parseRecencyFilterRange({ since: input.since, until: input.until });
+  const filters = resolveAskFilters(input);
+  const neighborContext = resolveAskNeighborContext(input);
+  // Neighbor expansion is dense-only (hybrid/lexical fusion has no stable
+  // neighbor ordering). Resolve the effective mode the same way retrieval will
+  // and reject a window that would land on a non-dense mode — including the
+  // default 'auto' resolving to hybrid for a code/error-token query.
+  if (neighborContext !== undefined) {
+    const requestedMode: SearchMode = input.search_mode ?? DEFAULT_ASK_SEARCH_MODE;
+    const effectiveMode: EffectiveSearchMode = requestedMode === 'auto'
+      ? resolveAutoSearchMode(query).mode
+      : requestedMode;
+    if (effectiveMode !== 'dense') {
+      throw new Error(
+        'neighbor context expansion is only supported with dense ask_knowledge ' +
+          `(effective search_mode was "${effectiveMode}"; set search_mode="dense")`,
+      );
+    }
+  }
   return executeAsk({
     question: query,
     kb: input.knowledge_base_name,
+    kbs,
     model: input.model_name,
     llmProfile: input.llm_profile,
     endpoint: input.endpoint,
@@ -313,9 +378,47 @@ export async function askKnowledge(
     taskContext: input.task_context,
     gate: input.gate,
     searchMode: input.search_mode,
+    ...(filters !== undefined ? { filters } : {}),
+    ...(neighborContext !== undefined ? { neighborContext } : {}),
     rerank: input.rerank,
     ...(input.request_id !== undefined ? { requestId: input.request_id } : {}),
   }, deps, nowMs(), onProgress);
+}
+
+/**
+ * Issue #974 — collapse the wire-level metadata-filter fields into a
+ * {@link SimilaritySearchFilters}, or `undefined` when none carry a value. A
+ * filter object with only empty strings/arrays is treated as absent so an
+ * all-empty payload keeps the unfiltered whole-base search.
+ */
+function resolveAskFilters(input: AskKnowledgeInput): SimilaritySearchFilters | undefined {
+  const candidate: SimilaritySearchFilters = {
+    extensions: input.extensions,
+    pathGlob: input.path_glob,
+    tags: input.tags,
+    since: input.since,
+    until: input.until,
+  };
+  const active =
+    (candidate.extensions?.some((value) => value.trim().length > 0) ?? false) ||
+    (typeof candidate.pathGlob === 'string' && candidate.pathGlob.length > 0) ||
+    (candidate.tags?.some((value) => value.trim().length > 0) ?? false) ||
+    (typeof candidate.since === 'string' && candidate.since.length > 0) ||
+    (typeof candidate.until === 'string' && candidate.until.length > 0);
+  return active ? candidate : undefined;
+}
+
+/**
+ * Issue #974 — resolve the neighbor-window fields into
+ * {@link NeighborContextOptions}, or `undefined` when no expansion is
+ * requested. `context_window` is shorthand for both sides; an explicit
+ * before/after wins over it.
+ */
+function resolveAskNeighborContext(input: AskKnowledgeInput): NeighborContextOptions | undefined {
+  const before = input.context_before ?? input.context_window ?? 0;
+  const after = input.context_after ?? input.context_window ?? 0;
+  if (before === 0 && after === 0) return undefined;
+  return { before, after };
 }
 
 export interface AskEvidence {
@@ -356,7 +459,7 @@ export async function retrieveAskEvidence(
     ? resolveAutoSearchMode(args.question).mode
     : requestedMode;
   return withSpan('kb.ask.retrieve', {
-    'kb.scope': args.kb ?? null,
+    'kb.scope': askScopeLabel(args),
     'kb.k': args.k,
     'kb.search_mode': effectiveMode,
     'kb.refresh': args.refresh,
@@ -382,7 +485,14 @@ export async function retrieveAskEvidence(
       if (args.refresh) {
         await deps.withWriteLock(manager.modelDir, async () => {
           await manager.initialize();
-          await manager.updateIndex(args.kb);
+          // Issue #975 — a subset refreshes each named KB under the one lock.
+          if (args.kbs !== undefined && args.kbs.length > 0) {
+            for (const name of args.kbs) {
+              await manager.updateIndex(name);
+            }
+          } else {
+            await manager.updateIndex(args.kb);
+          }
         });
       } else {
         await deps.loadReadOnlyIndex(manager);
@@ -396,15 +506,26 @@ export async function retrieveAskEvidence(
         // nearest-neighbour search (both happen inside similaritySearch).
         results = await withSpan('kb.ask.dense', {
           'kb.k': args.k,
-          'kb.scope': args.kb ?? null,
+          'kb.scope': askScopeLabel(args),
         }, () => manager.similaritySearch(
           args.question,
           args.k,
           undefined,
           args.kb,
-          undefined,
+          // Issue #974 — scope the dense candidates to the requested metadata
+          // filters (undefined when none, keeping the pre-#974 call shape).
+          args.filters,
           timing ? denseTiming : undefined,
+          // Pass opts only for a subset so the single/all path keeps its exact
+          // pre-#975 call shape.
+          ...(args.kbs && args.kbs.length > 0 ? [{ knowledgeBaseNames: args.kbs }] as const : [] as const),
         ));
+        // Issue #974 — widen each dense hit with its neighbor window (same
+        // source) before packing. Dense-only: the handler/askKnowledge reject a
+        // window on a hybrid/lexical effective mode. A no-op when unset.
+        if (args.neighborContext !== undefined) {
+          results = manager.expandWithNeighborContext(results, args.neighborContext);
+        }
         for (const result of results) {
           denseDistanceById.set(chunkIdFromMetadata(result.metadata as Record<string, unknown>), result.score);
         }
@@ -457,7 +578,7 @@ export async function retrieveAskEvidence(
         emitRelevanceGateDecision({
           process: 'mcp',
           query: args.question,
-          kbScope: args.kb ?? null,
+          kbScope: askScopeLabel(args),
           searchMode: effectiveMode,
           verdict: gate.verdict,
           taskContext: args.taskContext,
@@ -498,7 +619,10 @@ async function retrieveHybridOrLexical(input: {
 }): Promise<HybridOrLexicalRetrieval> {
   const { manager, args, effectiveMode, deps, denseTiming, timing } = input;
   const fetchK = hybridFetchK(args.k);
-  const kbs = await (deps.listLexicalKbs ?? listLexicalKbs)(args.kb);
+  // Issue #975 — a named subset scopes the lexical legs; else the scalar name.
+  const kbs = await (deps.listLexicalKbs ?? listLexicalKbs)(
+    args.kbs !== undefined && args.kbs.length > 0 ? args.kbs : args.kb,
+  );
 
   const runLexical = () => withSpan('kb.ask.lexical', {
     'kb.k': fetchK,
@@ -508,6 +632,10 @@ async function retrieveHybridOrLexical(input: {
     query: args.question,
     fetchK,
     refresh: args.refresh ? 'always' : 'when-empty',
+    // Issue #974 — apply the same metadata filters to BM25 hits before fusion,
+    // so a filtered ask cannot cite a file the filter excludes via the lexical
+    // leg. undefined keeps the unfiltered leg.
+    ...(args.filters !== undefined ? { filters: args.filters } : {}),
     loadIndex: deps.loadLexicalIndex,
     loadFreshIndex: deps.loadFreshLexicalIndex,
     invalidateIndex: deps.invalidateLexicalIndex,
@@ -526,14 +654,17 @@ async function retrieveHybridOrLexical(input: {
   // Hybrid: dense + lexical legs in parallel, then RRF + opt-in rerank.
   const densePromise = withSpan('kb.ask.dense', {
     'kb.k': fetchK,
-    'kb.scope': args.kb ?? null,
+    'kb.scope': askScopeLabel(args),
   }, () => manager.similaritySearch(
     args.question,
     fetchK,
     Number.POSITIVE_INFINITY,
     args.kb,
-    undefined,
+    // Issue #974 — filter the dense leg too; hybrid over-fetches both legs for
+    // RRF, so metadata filters must narrow each leg before fusion.
+    args.filters,
     timing ? denseTiming : undefined,
+    ...(args.kbs && args.kbs.length > 0 ? [{ knowledgeBaseNames: args.kbs }] as const : [] as const),
   )).then((rs) => rs.map((r): HybridChunk => ({
     pageContent: r.pageContent,
     metadata: r.metadata,
@@ -542,7 +673,7 @@ async function retrieveHybridOrLexical(input: {
   const [denseResults, lexical] = await Promise.all([densePromise, runLexical()]);
   if (timing) mergeAskDenseTiming(timing, denseTiming);
 
-  const rerankConfig = resolveRerankerConfig(process.env, args.rerank, args.kb ?? null);
+  const rerankConfig = resolveRerankerConfig(process.env, args.rerank, askScopeLabel(args));
   const fusion = fuseHybridResultsWithDiagnostics({
     denseResults,
     lexicalResults: lexical.hits,
@@ -560,7 +691,7 @@ async function retrieveHybridOrLexical(input: {
     config: rerankConfig,
     process: 'mcp',
     searchMode: 'hybrid',
-    kbScope: args.kb ?? null,
+    kbScope: askScopeLabel(args),
   }));
   if (timing && rerankResult.candidatesIn > 0) {
     timing.rerank_ms = rerankResult.tookMs;
@@ -761,7 +892,7 @@ export async function answerWithEvidence(
       k: args.k,
       context_budget_tokens: args.contextBudgetTokens,
       refreshed: args.refresh,
-      knowledge_base: args.kb ?? null,
+      knowledge_base: askScopeLabel(args),
       search_mode: searchMode,
       ...(args.taskContext !== undefined ? { task_context_provided: args.taskContext.trim() !== '' } : {}),
       ...(args.gate !== undefined ? { gate: args.gate } : {}),
@@ -782,7 +913,7 @@ export async function executeAsk(
 ): Promise<AskKnowledgeResult> {
   const timing: TimingPayload | null = args.timing ? {} : null;
   return withSpan('kb.ask', {
-    'kb.scope': args.kb ?? null,
+    'kb.scope': askScopeLabel(args),
     'kb.k': args.k,
     'kb.request_id': args.requestId,
   }, async () => {

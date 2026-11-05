@@ -14,16 +14,19 @@ import {
 } from './config/metrics-export.js';
 import {
   daemonUrlFromEnv,
+  daemonEndpointFromEnv,
   assertDaemonSocketPath,
   tryFetchDaemonHealth,
   type DaemonAdmissionHealth,
   type DaemonBuildHealth,
   type DaemonCommand,
+  type DaemonEndpoint,
   type DaemonHealth,
   type DaemonOwnership,
   type DaemonPrewarmHealth,
   type DaemonRunResult,
 } from './daemon-client.js';
+import { isPidAlive } from './process-liveness.js';
 import { readBuildInfo, type BuildInfo } from './build-info.js';
 import {
   DaemonAdmissionGate,
@@ -58,6 +61,7 @@ export const SERVE_HELP = `kb serve — resident local daemon for warm CLI reads
 Usage:
   kb serve [--host=127.0.0.1] [--port=17799] [--socket=/path/to/kb.sock] [--idle-timeout-ms=300000] [--warm]
   kb serve status [--json]
+  kb serve stop [--json]
 
 Starts a local JSON HTTP daemon used by \`kb search --daemon\`.
 The daemon accepts read-only search/list/stats requests and exits after the
@@ -65,9 +69,17 @@ idle timeout.
 
 \`kb serve status\` reports whether a daemon is reachable at the configured
 URL along with its PID, idle timeout, supported commands, uptime, and the
-build (version + commit) it is serving. It never starts or stops a daemon.
-When \`kb search --daemon\` cannot reach a daemon it prints a one-line notice
-to stderr and runs the search directly.
+build (version + commit) it is serving. \`kb serve status\` itself never starts
+or stops a daemon; use \`kb serve stop\` to stop one. When \`kb search --daemon\`
+cannot reach a daemon it prints a one-line notice to stderr and runs the search
+directly.
+
+\`kb serve stop\` gracefully stops the daemon reachable at the configured URL:
+it reads the PID from \`GET /health\`, sends SIGTERM (triggering the daemon's
+graceful drain), and polls \`/health\` until the daemon stops answering. It
+signals only a daemon reachable over loopback or a Unix-domain socket, and only
+when the reported PID is a live local process; a non-loopback URL is refused
+(exit 2). If no daemon is running it reports that and exits 3.
 
 Options:
   --host=<host>             Loopback host to bind (default: 127.0.0.1).
@@ -76,7 +88,8 @@ Options:
   --idle-timeout-ms=<ms>    Stop after this much idle time (default: 300000).
   --warm                    Pre-warm the active model, FAISS index, and
                             lexical indexes before the daemon reports ready.
-  --json                    \`kb serve status\`: emit the daemon health JSON.
+  --json                    \`kb serve status\`: emit the daemon health JSON;
+                            \`kb serve stop\`: emit the stop-result JSON.
   --quiet, -q               Suppress the "listening on" line (and the \`status\`
                             "start one with" hint), leaving only errors.
   --verbose, -v             Reserved for extra diagnostics.
@@ -99,10 +112,14 @@ Environment:
                             as \`kb serve --warm\`.
 
 Exit codes:
-  0   daemon started, or \`kb serve status\` found a reachable daemon
-  1   runtime error
-  2   invalid arguments or environment
-  3   \`kb serve status\`: no daemon reachable at the configured URL
+  0   daemon started, \`kb serve status\` found a reachable daemon, or
+      \`kb serve stop\` stopped the running daemon
+  1   runtime error (includes \`kb serve stop\` failing to signal or confirm
+      shutdown of the daemon)
+  2   invalid arguments or environment (includes \`kb serve stop\` refusing a
+      non-local daemon URL)
+  3   \`kb serve status\`/\`kb serve stop\`: no daemon reachable at the
+      configured URL (for \`stop\`, nothing to stop)
 `;
 
 /** Read-only commands the daemon accepts, advertised by \`GET /health\`. */
@@ -144,6 +161,13 @@ export interface StartDaemonServerOptions extends Partial<ServeArgs> {
    * the health snapshot is deterministic.
    */
   buildInfo?: BuildInfo;
+  /**
+   * Socket-hardening bounds for the daemon's HTTP server (issue #1029). Unset
+   * fields fall back to the `DEFAULT_DAEMON_*` constants via
+   * `resolveDaemonHttpLimits`; tests pass explicit values to assert they are
+   * applied to the listening server.
+   */
+  httpLimits?: Partial<DaemonHttpLimits>;
 }
 
 export interface DaemonCommandHandlerOptions {
@@ -194,11 +218,57 @@ const DEFAULT_SERVE_ARGS: ServeArgs = {
   warm: false,
 };
 
+/**
+ * Socket-hardening bounds for the resident daemon's HTTP server (issue #1029).
+ * Like the remote HTTP/SSE host, the daemon was created with no explicit
+ * requestTimeout / headersTimeout / keepAliveTimeout / maxConnections, so a
+ * slow/abusive client could hold a connection — and an admission slot — open
+ * indefinitely. These are applied explicitly in `startDaemonServer`.
+ *
+ * Timeout defaults mirror Node's own current defaults (defence-in-depth, not a
+ * behaviour change). The daemon is a loopback read cache fronted by the
+ * admission gate (default concurrency 8 / queue 128), so a connection cap of
+ * 256 leaves generous headroom while bounding raw socket count. A timeout of
+ * `0` disables that timeout; a `maxConnections` of `0` leaves the count
+ * unbounded because the cap assignment is skipped (Node itself treats a literal
+ * `maxConnections = 0` as refuse-all, so it must not be assigned).
+ */
+export const DEFAULT_DAEMON_REQUEST_TIMEOUT_MS = 300_000;
+export const DEFAULT_DAEMON_HEADERS_TIMEOUT_MS = 60_000;
+export const DEFAULT_DAEMON_KEEP_ALIVE_TIMEOUT_MS = 5_000;
+export const DEFAULT_DAEMON_MAX_CONNECTIONS = 256;
+
+export interface DaemonHttpLimits {
+  requestTimeoutMs: number;
+  headersTimeoutMs: number;
+  keepAliveTimeoutMs: number;
+  maxConnections: number;
+}
+
+/**
+ * Resolve the effective daemon socket-hardening bounds, filling any unset
+ * field with its `DEFAULT_DAEMON_*` constant. Exposed so tests and callers can
+ * assert/override the applied values deterministically.
+ */
+export function resolveDaemonHttpLimits(
+  overrides?: Partial<DaemonHttpLimits>,
+): DaemonHttpLimits {
+  return {
+    requestTimeoutMs: overrides?.requestTimeoutMs ?? DEFAULT_DAEMON_REQUEST_TIMEOUT_MS,
+    headersTimeoutMs: overrides?.headersTimeoutMs ?? DEFAULT_DAEMON_HEADERS_TIMEOUT_MS,
+    keepAliveTimeoutMs: overrides?.keepAliveTimeoutMs ?? DEFAULT_DAEMON_KEEP_ALIVE_TIMEOUT_MS,
+    maxConnections: overrides?.maxConnections ?? DEFAULT_DAEMON_MAX_CONNECTIONS,
+  };
+}
+
 export async function runServe(rest: string[]): Promise<number> {
   // Issue #739 — resolve the shared --quiet/--verbose flags before dispatching.
   const { verbosity, rest: args } = extractVerbosity(rest);
   if (args[0] === 'status') {
     return runServeStatus(args.slice(1), verbosity);
+  }
+  if (args[0] === 'stop') {
+    return runServeStop(args.slice(1), verbosity);
   }
 
   let parsed: ServeArgs;
@@ -350,6 +420,207 @@ export async function runServeStatus(args: string[], verbosity: Verbosity = 'nor
   return 0;
 }
 
+/** Poll interval while `kb serve stop` waits for the daemon to drain and exit. */
+export const SERVE_STOP_POLL_INTERVAL_MS = 100;
+/**
+ * Extra time `kb serve stop` waits beyond the daemon's own drain budget before
+ * giving up. The daemon force-exits at `drainTimeoutMs + DRAIN_FORCE_EXIT_GRACE_MS`
+ * (see `runServe`), so the stop deadline sits a margin past that worst case.
+ */
+export const SERVE_STOP_EXTRA_GRACE_MS = 2000;
+
+/**
+ * Injectable seams for {@link runServeStop}. Defaults use the real daemon
+ * client, `process.kill`, and wall-clock timers; tests override them to drive
+ * the signal/poll logic deterministically without a live process.
+ */
+export interface ServeStopDeps {
+  endpointFromEnv?: (env?: NodeJS.ProcessEnv) => DaemonEndpoint;
+  fetchHealth?: () => Promise<DaemonHealth | null>;
+  kill?: (pid: number, signal: NodeJS.Signals) => void;
+  isPidAlive?: (pid: number) => boolean;
+  sleep?: (ms: number) => Promise<void>;
+  now?: () => number;
+  timeoutMs?: number;
+  pollIntervalMs?: number;
+}
+
+/**
+ * `kb serve stop` — gracefully stop the resident daemon reachable at the
+ * configured `KB_DAEMON_URL`.
+ *
+ * Reads the PID from `GET /health`, sends SIGTERM (triggering the daemon's
+ * existing graceful drain), and polls `/health` until the daemon stops
+ * answering. Safety (issue #1134): it only signals a daemon it can prove is
+ * local — a loopback URL or a Unix-domain socket — and whose reported PID is a
+ * live local process, so a misconfigured non-loopback `KB_DAEMON_URL` can never
+ * make it signal an unrelated local process.
+ *
+ * Exit codes mirror the `kb serve` taxonomy: 0 stopped, 1 runtime error
+ * (no PID, signal failed, or still reachable after the drain budget), 2 bad
+ * argument / refusing a non-local daemon, 3 no daemon running.
+ */
+export async function runServeStop(
+  args: string[],
+  verbosity: Verbosity = 'normal',
+  deps: ServeStopDeps = {},
+): Promise<number> {
+  let json = false;
+  for (const raw of args) {
+    if (raw === '--json') {
+      json = true;
+      continue;
+    }
+    process.stderr.write(`kb serve stop: unexpected argument: ${raw}\n`);
+    return EXIT.USAGE;
+  }
+
+  const endpointFromEnv = deps.endpointFromEnv ?? daemonEndpointFromEnv;
+  const fetchHealth = deps.fetchHealth ?? probeDaemonHealthForStop;
+  const kill = deps.kill ?? ((pid, signal) => process.kill(pid, signal));
+  const pidAlive = deps.isPidAlive ?? isPidAlive;
+  const sleep = deps.sleep ?? ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const now = deps.now ?? Date.now;
+
+  let endpoint: DaemonEndpoint;
+  try {
+    endpoint = endpointFromEnv(process.env);
+  } catch (err) {
+    process.stderr.write(`kb serve stop: ${(err as Error).message}\n`);
+    return EXIT.USAGE;
+  }
+  const urlHref = endpoint.url.href;
+
+  // Safety (issue #1134): only signal a PID we can prove belongs to a local
+  // daemon. A non-loopback KB_DAEMON_URL would make the reported PID refer to a
+  // process on another host, while `process.kill(pid)` would signal whatever
+  // LOCAL process happens to hold that number — so refuse rather than risk
+  // killing an unrelated process.
+  if (!isLocalDaemonEndpoint(endpoint)) {
+    process.stderr.write(
+      `kb serve stop: refusing to signal a non-local daemon at ${urlHref}; stop it on its own host instead\n`,
+    );
+    return EXIT.USAGE;
+  }
+
+  let health: DaemonHealth | null;
+  try {
+    health = await fetchHealth();
+  } catch (err) {
+    // A daemon answered but its /health payload was unusable.
+    process.stderr.write(`kb serve stop: ${(err as Error).message}\n`);
+    return EXIT.INTERNAL;
+  }
+
+  if (health === null) {
+    if (json) {
+      process.stdout.write(`${JSON.stringify({ stopped: false, reachable: false, url: urlHref })}\n`);
+    } else {
+      process.stdout.write(`kb serve: no daemon running at ${urlHref}\n`);
+    }
+    // 3 — nothing to stop; mirrors `kb serve status`'s "no daemon reachable".
+    return 3;
+  }
+
+  const pid = health.pid;
+  if (pid === undefined || !Number.isInteger(pid) || pid <= 0) {
+    process.stderr.write(
+      `kb serve stop: daemon at ${urlHref} did not report a usable pid; cannot signal it\n`,
+    );
+    return EXIT.INTERNAL;
+  }
+
+  // Defensive: a local daemon must actually be alive under that PID before we
+  // signal it. If it is not, something other than our daemon answered /health.
+  if (!pidAlive(pid)) {
+    process.stderr.write(
+      `kb serve stop: daemon at ${urlHref} reported pid ${pid}, which is not a live local process; refusing to signal\n`,
+    );
+    return EXIT.INTERNAL;
+  }
+
+  try {
+    kill(pid, 'SIGTERM');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ESRCH') {
+      // Raced the daemon's own exit — it is already gone.
+      return reportStopped(pid, urlHref, json, verbosity);
+    }
+    process.stderr.write(
+      `kb serve stop: failed to signal daemon pid ${pid}: ${(err as Error).message}\n`,
+    );
+    return EXIT.INTERNAL;
+  }
+
+  // Poll /health until the daemon stops answering, bounded by its drain budget
+  // plus a grace margin (the daemon force-exits at drainTimeoutMs + grace).
+  const timeoutMs = deps.timeoutMs
+    ?? resolveDaemonDrainTimeoutMs() + DRAIN_FORCE_EXIT_GRACE_MS + SERVE_STOP_EXTRA_GRACE_MS;
+  const pollIntervalMs = deps.pollIntervalMs ?? SERVE_STOP_POLL_INTERVAL_MS;
+  const deadlineAt = now() + timeoutMs;
+  while (now() < deadlineAt) {
+    let current: DaemonHealth | null;
+    try {
+      current = await fetchHealth();
+    } catch {
+      // An unusable payload mid-shutdown: keep waiting for the socket to close.
+      current = health;
+    }
+    if (current === null) {
+      return reportStopped(pid, urlHref, json, verbosity);
+    }
+    const remainingMs = deadlineAt - now();
+    if (remainingMs <= 0) break;
+    await sleep(Math.min(pollIntervalMs, remainingMs));
+  }
+
+  process.stderr.write(
+    `kb serve stop: signaled daemon pid ${pid} but it was still reachable at ${urlHref} after ${timeoutMs}ms\n`,
+  );
+  return EXIT.INTERNAL;
+}
+
+/**
+ * Probe `GET /health` for `kb serve stop`, resolving to `null` whenever nothing
+ * is listening. `tryFetchDaemonHealth` already maps a refused TCP connection to
+ * `null`, but a stopped daemon on a Unix-domain socket *unlinks* its socket
+ * file, so the next probe fails with `ENOENT` — which the generic client
+ * surfaces as a raw error rather than "unreachable". Treat that missing socket
+ * as a stopped daemon so both the initial "nothing to stop" check and the
+ * post-signal shutdown poll see the daemon disappear. A `DaemonProtocolError`
+ * (a daemon answered with an unusable payload) still propagates.
+ */
+async function probeDaemonHealthForStop(): Promise<DaemonHealth | null> {
+  try {
+    return await tryFetchDaemonHealth({ env: process.env });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return null;
+    throw err;
+  }
+}
+
+/**
+ * Whether the configured daemon endpoint is one `kb serve stop` can safely
+ * signal: a Unix-domain socket (same host by construction) or a loopback TCP
+ * URL. A non-loopback URL could resolve to another host whose PID must not be
+ * mapped onto a local `process.kill`.
+ */
+function isLocalDaemonEndpoint(endpoint: DaemonEndpoint): boolean {
+  if (endpoint.socketPath !== undefined) return true;
+  const host = endpoint.url.hostname;
+  return host === '127.0.0.1' || host === 'localhost' || host === '::1' || host === '[::1]';
+}
+
+function reportStopped(pid: number, urlHref: string, json: boolean, verbosity: Verbosity): number {
+  if (json) {
+    process.stdout.write(`${JSON.stringify({ stopped: true, pid, url: urlHref })}\n`);
+  } else if (verbosity !== 'quiet') {
+    // The confirmation line is non-essential; --quiet leaves only errors.
+    process.stdout.write(`kb serve: stopped daemon (pid ${pid}) at ${urlHref}\n`);
+  }
+  return EXIT.OK;
+}
+
 function formatServeStatus(health: DaemonHealth, queriedUrl: URL): string {
   const lines = [`kb serve: daemon running at ${health.url ?? queriedUrl.href}`];
   if (health.pid !== undefined) lines.push(`  pid:          ${health.pid}`);
@@ -474,9 +745,24 @@ export async function startDaemonServer(
   });
 
   const server = http.createServer((req, res) => {
-    resetIdleTimer();
-    void handleRequest(req, res, handlers, metricsHandler, buildHealth, admission);
+    // Issue #1124 — the idle-shutdown timer is re-armed from inside
+    // `handleRequest`, and only for validated client work (`POST /v1/run`). The
+    // unauthenticated `/health` and `/metrics` probes that monitoring setups
+    // scrape continuously are deliberately NOT treated as activity, so they can
+    // no longer postpone the `--idle-timeout-ms` reclaim indefinitely.
+    void handleRequest(req, res, handlers, metricsHandler, buildHealth, admission, resetIdleTimer);
   });
+
+  // Issue #1029 — bound slow/abusive clients at the socket layer before the
+  // server starts listening, so a stuck connection can no longer hold an
+  // admission slot open indefinitely.
+  const httpLimits = resolveDaemonHttpLimits(options.httpLimits);
+  server.requestTimeout = httpLimits.requestTimeoutMs;
+  server.headersTimeout = httpLimits.headersTimeoutMs;
+  server.keepAliveTimeout = httpLimits.keepAliveTimeoutMs;
+  if (httpLimits.maxConnections > 0) {
+    server.maxConnections = httpLimits.maxConnections;
+  }
 
   server.on('close', () => {
     if (idleTimer) clearTimeout(idleTimer);
@@ -856,16 +1142,21 @@ async function handleRequest(
   metricsHandler: () => Promise<string>,
   buildHealth: () => DaemonHealth,
   admission: DaemonAdmissionGate,
+  resetIdleTimer: () => void,
 ): Promise<void> {
   const url = new URL(req.url ?? '/', 'http://placeholder'); // NOSONAR typescript:S5332 — parse-only base, never fetched
   if (req.method === 'GET' && url.pathname === '/health') {
+    // Issue #1124 — health probes are NOT client work: do not re-arm the idle
+    // timer, or a `kb serve status` cron / autostart health loop would keep the
+    // daemon resident forever and defeat `--idle-timeout-ms`.
     writeJson(res, 200, buildHealth());
     return;
   }
   if (url.pathname === '/metrics') {
     // /metrics stays outside admission control: scraping must keep working
     // under load, which is exactly when the daemon_inflight / rejected
-    // gauges matter most.
+    // gauges matter most. Issue #1124 — like /health, a Prometheus scrape of
+    // /metrics is not client work and must not postpone idle shutdown.
     await handleMetricsRequest(req, res, metricsHandler);
     return;
   }
@@ -899,6 +1190,15 @@ async function handleRequest(
     rejectDraining(res);
     return;
   }
+
+  // Issue #1124 — a validated, admissible client command reached the daemon's
+  // work endpoint; THIS is the real activity the idle timeout tracks, so re-arm
+  // the timer here rather than for every inbound request. The unauthenticated
+  // /health and /metrics probes handled above never reach this point, so a
+  // status cron / autostart health loop / Prometheus scrape can no longer
+  // postpone the operator's --idle-timeout-ms reclaim. Malformed or draining
+  // requests (handled above with early returns) are likewise not counted.
+  resetIdleTimer();
 
   const accepted = admission.run(async () => {
     try {

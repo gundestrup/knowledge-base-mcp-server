@@ -51,7 +51,7 @@ All install paths need [Node.js](https://nodejs.org/) 22 or newer and npm.
 npx -y @jeanibarz/knowledge-base-mcp-server@latest
 ```
 
-`npx` fetches the package from npm and launches the stdio server. Point your MCP client at that same command and set the environment variables described under [Configure](#configure). [docs/clients.md](docs/clients.md) has copy-pasteable config snippets for Claude Desktop, Codex CLI, Cursor, Continue, and Cline.
+`npx` fetches the package from npm and launches the stdio server. Point your MCP client at that same command and set the environment variables described under [Configure](#configure). [docs/clients.md](docs/clients.md) has copy-pasteable config snippets for Claude Desktop, Claude Code, Codex CLI, Cursor, Continue, Cline, and the editors with native MCP support — VS Code, Windsurf, and JetBrains.
 
 > **Pin `@latest`, not the unversioned spec.** `npx -y @jeanibarz/knowledge-base-mcp-server` (no version) caches the resolved version in `~/.npm/_npx/` indefinitely — subsequent client launches reuse that cached version even after a new release ships. The `@latest` form hashes to a different cache key and re-resolves on every launch, so new fixes arrive on the next client restart instead of requiring a manual `~/.npm/_npx/` clear. See [RFC 012 §2.4](docs/rfcs/012-cli-distribution.md).
 
@@ -244,6 +244,8 @@ KB_STATS_DESCRIPTION="Report engineering KB index and transport health."
 
 ## Use the MCP server
 
+First wire your client to the server: [docs/clients.md](docs/clients.md) has paste-ready config for every supported client, including the editors with native MCP support — [VS Code](docs/clients.md#vs-code), [Windsurf](docs/clients.md#windsurf), and [JetBrains](docs/clients.md#jetbrains).
+
 ### Tools
 
 Your client sees these tools (registered in `src/KnowledgeBaseServer.ts`):
@@ -256,6 +258,7 @@ Your client sees these tools (registered in `src/KnowledgeBaseServer.ts`):
 | `list_models` | List the registered embedding models and which one is active. |
 | `kb_stats` | Read-only corpus, index, model, cache, and transport statistics — useful for a health check without touching the index. |
 | `diff_index` | Compare retrieval results across two persisted index versions, to see what a rebuild actually changed. |
+| `find_related` | Read-only "more-like-this" expansion — given a chunk id or `kb://` URI from an earlier result, return the chunks most similar to that one, without re-running a text query. The MCP equivalent of the `kb related` CLI command. |
 | `add_document` | Write a text document into a KB through the guarded mutation path. |
 | `delete_document` | Delete a KB-relative document through the guarded mutation path. |
 | `reindex_knowledge_base` | Force a global rebuild, optionally validating a named KB first. |
@@ -267,6 +270,10 @@ Exact input schemas, types, and bounds are generated from the shipped tool regis
 ### Resources
 
 Clients that want to enumerate and read source documents directly, rather than searching them, can use MCP resources. `resources/list` returns `kb://<knowledge-base>/<encoded-relative-path>` URIs for every ingestable, non-quarantined file under `KNOWLEDGE_BASES_ROOT_DIR`; `resources/read` returns the raw document as text, or as a base64 PDF blob when `.pdf` has been opted into ingest. See [`docs/mcp-resources.md`](docs/mcp-resources.md) for URI, MIME type, and percent-encoding details.
+
+### Prompts
+
+The server can also expose reusable MCP **prompt templates** — `summarize_kb`, `cite_sources`, `compare_notes`, and `research_brief` — that clients (such as Claude Desktop) surface as slash-commands in their "/" menu. Each template pre-wires a grounded, citation-disciplined `retrieve_knowledge` workflow so users get a well-formed prompt with one click. This surface is **opt-in** (`KB_MCP_PROMPTS=on`) and **read-only**: serving a prompt only substitutes your arguments into instruction text and returns it — the server runs no retrieval and calls no LLM while doing so. See [`docs/mcp-prompts.md`](docs/mcp-prompts.md) for the template registry, arguments, and examples.
 
 ### Logging
 
@@ -427,6 +434,30 @@ kb related alpha/docs/deploy.md#L42-L78  # find dense neighbors of an existing r
 ```
 
 `kb open` validates the path against the KB root and prints it; add `--json` for the cited line range and an `editorUri`. `kb related` fetches the indexed seed chunk behind the handle, searches with its text, and excludes the seed itself unless you pass `--include-self`.
+
+**Browsing results interactively.** `--interactive` (`-i`) opens a full-screen results picker instead of printing the hits. It works only with markdown output on a terminal: `-i` is silently ignored when `--format` is `json`, `vimgrep`, or `compact`, and with markdown output stdout must be a TTY — redirecting or piping fails with `kb search: --interactive requires a TTY`. It also can't be combined with `--batch-jsonl` or the advanced operators (`--diverse`, `--anti-query`, `--plus`, `--minus`).
+
+Inside the picker you scroll the hits, filter within them, and toggle between a flat list of chunks (each chunk is one indexed passage of a file) and a view that groups those chunks under their source file. In the flat view, `Space` marks chunks; `Enter` then prints the marked chunks — or, if none are marked, the focused chunk (flat view) or whole source (grouped view) — to the terminal and exits. These are the keys, the same list the picker shows when you press `?`:
+
+```
+Keys:
+  j / Down     next result
+  k / Up       previous result
+  PgDn / PgUp  page down / up
+  Ctrl-D/Ctrl-U  half page down / up
+  g            jump to top
+  G            jump to bottom
+  /            filter results (type to narrow, Esc clears, Enter selects)
+  Space        mark / unmark focused chunk in flat view
+  Tab          toggle flat / grouped-by-source view
+  Enter        print marked chunks, or focused row/source if none are marked
+  ?            toggle this help
+  q / Esc      quit (no output)
+```
+
+```bash
+kb search "rollback procedure" -i        # browse hits, then Enter to print a selection
+```
 
 ### Ask: answers from a local LLM
 
@@ -779,6 +810,56 @@ npm run bench:beir -- --dataset=scifact --split=test --mode=lexical --lexical-un
 The runner builds a temporary KB root and emits metrics JSON plus a TREC run file, along with reproduction metadata: git SHA, command, dataset checksum, runtime versions, chunking config, and latency percentiles. **These are local artifacts, not official BEIR leaderboard submissions** — the lexical source path is scored at document level, matching `kb search --mode=lexical --lexical-unit=source`. See [benchmarks/README.md](benchmarks/README.md#beirscifact-local-retrieval-benchmark) for smoke-test commands and caveats, and [benchmarks/results/README.md](benchmarks/results/README.md) for the archived SciFact run.
 
 To reproduce the committed **dense / small-model** numbers (BEIR, MTEB, and BRIGHT with `nomic-embed-text` on Ollama) end to end, follow the step-by-step runbook in [benchmarks/REPRODUCE.md](benchmarks/REPRODUCE.md).
+
+### Committed small-model results
+
+The repo contains committed benchmark runs for two small embedding models on
+Ollama — `nomic-embed-text` and `dengcao/Qwen3-Embedding-0.6B:Q8_0`. These are
+**local reproducible runs, not official leaderboard submissions**; every number
+below is copied verbatim from its committed artifact, higher is better.
+
+Scores are **nDCG@10**: a 0–1 measure of how well the top 10 results are ranked
+(1 is perfect). Each mode is a retrieval strategy of `kb search` — *lexical*
+(keyword matching), *dense* (embedding similarity), *hybrid* (the two fused), and
+*+rerank* (a second-pass model reorders the top hits). Means taken over different
+numbers of datasets or tasks are not comparable to each other or to official
+leaderboards.
+
+**MTEB** — mean main score (nDCG@10 for these two retrieval tasks) over the committed tasks (SciFact, NFCorpus), `mteb` 1.19.10. A 2-task mean is not comparable to published MTEB averages over dozens of tasks:
+
+| Model | Mean (2 tasks) | SciFact | NFCorpus | Artifact |
+| --- | ---: | ---: | ---: | --- |
+| `nomic-embed-text` | 0.353055 | 0.52408 | 0.18203 | [mteb/nomic.json](benchmarks/results/mteb/nomic.json) |
+| `Qwen3-Embedding-0.6B:Q8_0` | 0.487265 | 0.67752 | 0.29701 | [mteb/qwen3.json](benchmarks/results/mteb/qwen3.json) |
+
+**BEIR matrix** — multi-domain mean nDCG@10 across 5 datasets (scifact, nfcorpus, arguana, scidocs, fiqa):
+
+| Model | lexical | dense | hybrid | hybrid+rerank | Artifact |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `nomic-embed-text` | 0.337237 | 0.254749 | 0.320355 | 0.376205 | [nomic/beir-matrix.json](benchmarks/results/beir/matrix/nomic/beir-matrix.json) (`04f3eb8`) |
+| `Qwen3-Embedding-0.6B:Q8_0` | 0.337237 | 0.373419 | 0.389288 | 0.386762 | [qwen3/beir-matrix.json](benchmarks/results/beir/matrix/qwen3/beir-matrix.json) (`869d527`) |
+
+Lexical mode is model-independent (it uses the shared lexical index, not the
+embedding model), so both rows report the same lexical score. The qwen3 artifact
+also records additional modes (late, hybrid+late, hybrid+rerank+contextual); two
+of them ran on only 2 or 3 of the 5 datasets, so their means are not comparable
+to the full-coverage rows — see the full matrix.
+
+**BRIGHT** — reasoning-intensive retrieval, mean nDCG@10 over 2 tasks (biology, economics):
+
+| Model | dense | hybrid+rerank | Artifact |
+| --- | ---: | ---: | --- |
+| `nomic-embed-text` | 0.1476 | 0.1293 | [bright/nomic/bright-report.md](benchmarks/results/bright/nomic/bright-report.md) (`abe8012`) |
+| `Qwen3-Embedding-0.6B:Q8_0` | 0.1586 | 0.1309 | [bright/qwen3/bright-report.md](benchmarks/results/bright/qwen3/bright-report.md) (`ee23284`) |
+
+BRIGHT queries need multi-step reasoning, so nDCG@10 is low across all systems.
+One caveat from the run report: BRIGHT lists documents to ignore per query, but
+this harness does not subtract them from the ranking, so scores may run slightly
+high versus the official harness.
+
+The git SHA after each artifact is the code revision recorded inside that run.
+Full per-dataset and per-mode breakdowns, plus latency and provenance, live in
+[benchmarks/results/README.md](benchmarks/results/README.md).
 
 Optuna tuning is optional and runs only when you invoke it. This sweeps lexical chunking parameters and writes a replayable best-config file:
 
