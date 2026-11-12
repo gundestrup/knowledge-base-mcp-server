@@ -11,28 +11,33 @@ name, description, or input schema, and commit the result. The
 `docs:check-mcp-tools` gate (part of `npm run check`) fails if this file
 drifts.
 
-The server exposes 10 tools, 3 of which are only registered when `KB_INGEST_ENABLED` is set.
+The server exposes 13 tools, 3 of which are only registered when `KB_INGEST_ENABLED` is set.
 
 ## Tools
 
 | Tool | Gated | Description |
 | --- | --- | --- |
-| [`list_knowledge_bases`](#list_knowledge_bases) | — | Lists the available knowledge bases. |
+| [`list_knowledge_bases`](#list_knowledge_bases) | — | Lists the available knowledge bases. Returns a JSON array of knowledge-base names by default. Pass include_counts: true to instead return one object per shelf, { name, document_count }, where document_count is the number of ingestable documents on that shelf (0 for an empty shelf). |
 | [`retrieve_knowledge`](#retrieve_knowledge) | — | Retrieves similar chunks from the knowledge base based on a query. Optionally, if a knowledge base is specified, only that one is searched; otherwise, all available knowledge bases are considered. By default, at most 10 documents are returned. Dense retrieval limits results to a similarity score of 2 by default; a different threshold can optionally be provided. Hybrid retrieval does not apply this threshold because both legs are over-fetched for fusion. |
 | [`ask_knowledge`](#ask_knowledge) | — | Answers a question from retrieved knowledge-base context using the configured local OpenAI-compatible LLM endpoint. Returns a structured payload with answer, citations, context-packing diagnostics, abstention_reason, LLM provenance, retrieval model, and optional timing. Use retrieve_knowledge when you only need raw chunks. |
 | [`list_models`](#list_models) | — | Lists the embedding models registered for retrieval. Returns an array of {model_id, provider, model_name, active}. Use the model_id as the optional `model_name` argument to retrieve_knowledge to query a specific model instead of the active default. |
 | [`kb_stats`](#kb_stats) | — | Reports observability stats for the knowledge base index: per-KB file_count, chunk_count, total_bytes_indexed and last_updated_at; the active embedding provider/model/dim; the on-disk index_path; server version/commit/uptime; process-lifetime chat-completion calls with bounded provider/model attribution, attempts/retries, cache outcomes, and answer impact; answer-cache counters; and HTTP/SSE transport counters when a remote transport is active. Pass `knowledge_base_name` to scope to a single KB; omit it to get an entry per registered KB. |
 | [`diff_index`](#diff_index) | — | Compares retrieval-result churn across two persisted FAISS index versions for a list of plaintext queries. Returns rank deltas, top-K membership changes, and stability/churn scores; useful before promoting a new index version. |
 | [`find_related`](#find_related) | — | Finds chunks semantically similar to an existing result ("more-like-this"), seeded by a chunk id or kb:// URI from a prior retrieve_knowledge hit rather than a text query. Resolves the seed chunk from the active index and runs dense similarity search on its text, excluding the seed itself by default. Read-only. Returns a kb.related.v1 JSON payload (seed, scoped_kb, related results). Defaults: k=10, threshold=2, scoped to the seed chunk's knowledge base; pass all_kbs=true to search every KB or include_self=true to keep the seed in the results. |
+| [`list_facets`](#list_facets) | — | Enumerates the frontmatter facet values that actually exist across a knowledge base, so a client can discover the valid vocabulary for the retrieve_knowledge / ask_knowledge `tags` filter instead of guessing. Walks every note, parses YAML frontmatter, and reports each facet's distinct values with per-note counts (a value is counted once per note; array facets count each element). Read-only. Returns a kb.tags.v1 JSON payload (schemaVersion, knowledgeBases, notesScanned, facets) identical to `kb tags --format=json`. Defaults to the tags/status/type facets across every KB; pass knowledge_base_name to scope to one KB or facet to report a single frontmatter key. |
+| [`recommend_knowledge_base`](#recommend_knowledge_base) | — | Recommends which knowledge base ("shelf") — and which existing file inside it — best fits a topic, so an MCP client can route a search or an add_document write instead of guessing a shelf or scanning them all. Runs one cross-KB similarity search for the topic, picks the KB with the closest hit, and names the single best existing file in it. Read-only. Returns a kb.recommend.v1 JSON payload: recommended_kb, existing_target (the best file, or null when no file is within the confidence threshold), confidence (the match distance; lower = closer), and a confident boolean (true when an existing_target was found). Score and threshold semantics are identical to `kb where --format=json`; the CLI-only `kb remember` copy-paste is omitted. Defaults: k=20, threshold=1.0, across every KB; pass model_name to override the active embedding model for this call. |
+| [`export_citations`](#export_citations) | — | Exports a bibliography (BibTeX, CSL-JSON, plain text, or RIS) for one or more notes, turning retrieval results into citations without a separate terminal step. The selector matches `kb open`: a chunk id or kb:// URI from a prior retrieve_knowledge/find_related hit, or a KB-relative path such as "research/papers/example.md" (any line/chunk fragment identifies only the containing note). Pass an array of selectors to emit one merged bibliography — BibTeX/RIS records deduped by cite key, a single CSL-JSON array, or one text line per note; selectors resolve in order and any failure errors the whole call (no partial output). Citation fields come from each note's YAML frontmatter (authors/author, title, published/date, doi, url, arxiv_id); a note with missing or invalid frontmatter still yields a citation keyed from its path. Read-only and index-independent — it never consults the index or live KB services. Returns the formatted bibliography as text. Default format: bibtex. |
 | [`add_document`](#add_document) | `KB_INGEST_ENABLED` | Adds or overwrites a UTF-8 document in a knowledge base, creating parent directories as needed, then updates the active model index so the new content is queryable immediately. |
 | [`delete_document`](#delete_document) | `KB_INGEST_ENABLED` | DESTRUCTIVE: Deletes a document from a knowledge base and removes its hash sidecar. FAISS does not support vector deletion in this server, so orphan vectors for the removed file persist until a full rebuild; run reindex_knowledge_base after deletes if vector hygiene matters. |
 | [`reindex_knowledge_base`](#reindex_knowledge_base) | `KB_INGEST_ENABLED` | Forces the active model to fully rebuild its FAISS index from on-disk files, replacing the in-memory store and clearing orphan vectors left behind by prior delete_document calls. The rebuild always covers every KB because FAISS lacks per-vector deletion; passing knowledge_base_name is accepted (and recorded in the response) but does not narrow the rebuild scope. |
 
 ## `list_knowledge_bases`
 
-Lists the available knowledge bases.
+Lists the available knowledge bases. Returns a JSON array of knowledge-base names by default. Pass include_counts: true to instead return one object per shelf, { name, document_count }, where document_count is the number of ingestable documents on that shelf (0 for an empty shelf).
 
-_No input parameters._
+| Field | Type | Required | Constraints | Description |
+| --- | --- | --- | --- | --- |
+| `include_counts` | boolean | no | — | When true, return one object per knowledge base as { name, document_count } instead of a bare array of names. document_count is the number of ingestable documents on that shelf (0 for an empty shelf), computed by a filesystem walk. Omitted/false keeps the default array-of-names output. |
 
 ## `retrieve_knowledge`
 
@@ -50,8 +55,8 @@ Retrieves similar chunks from the knowledge base based on a query. Optionally, i
 | `tags` | array of string | no | max 64 items | Limit results to chunks whose source file has ALL of these tags in its YAML frontmatter. In hybrid mode, applied to lexical candidates before fusion. |
 | `since` | string | no | — | Limit results to chunks whose current source-file mtime is at or after this bound. Accepts durations like "30d"/"24h" or ISO dates/timestamps; mtime can differ from indexed-content time on stale indexes. In hybrid mode, applied to lexical candidates before fusion. |
 | `until` | string | no | — | Limit results to chunks whose current source-file mtime is at or before this bound. Accepts durations like "30d"/"24h" or ISO dates/timestamps; mtime can differ from indexed-content time on stale indexes. In hybrid mode, applied to lexical candidates before fusion. |
-| `context_before` | integer | no | min 0; max 5 | Opt-in neighbor context: include up to this many preceding chunks from the same source around each dense semantic match. Defaults to 0. |
-| `context_after` | integer | no | min 0; max 5 | Opt-in neighbor context: include up to this many following chunks from the same source around each dense semantic match. Defaults to 0. |
+| `context_before` | integer | no | min 0; max 5 | Opt-in neighbor context: include up to this many preceding chunks from the same source around each dense or hybrid match (not lexical). Defaults to 0. |
+| `context_after` | integer | no | min 0; max 5 | Opt-in neighbor context: include up to this many following chunks from the same source around each dense or hybrid match (not lexical). Defaults to 0. |
 | `context_window` | integer | no | min 0; max 5 | Shorthand for setting context_before and context_after to the same value. Defaults to 0. |
 | `k` | integer | no | min 1; max 50 | Retrieval top-K. Default 10. |
 | `search_mode` | enum | no | one of: `dense`, `hybrid`, `lexical`, `auto` | Retrieval mode. "dense" (default) uses FAISS only. "hybrid" fuses FAISS top-N with per-KB BM25 top-N via Reciprocal Rank Fusion. "lexical" is BM25-only. "auto" keeps dense for prose and upgrades code/error-token queries to hybrid. See #206 + #973. |
@@ -77,9 +82,9 @@ Answers a question from retrieved knowledge-base context using the configured lo
 | `tags` | array of string | no | max 64 items | Limit answer evidence to chunks whose source file has ALL of these tags in its YAML frontmatter. In hybrid mode, applied to lexical candidates before fusion. |
 | `since` | string | no | — | Limit answer evidence to chunks whose current source-file mtime is at or after this bound. Accepts durations like "30d"/"24h" or ISO dates/timestamps; mtime can differ from indexed-content time on stale indexes. In hybrid mode, applied to lexical candidates before fusion. |
 | `until` | string | no | — | Limit answer evidence to chunks whose current source-file mtime is at or before this bound. Accepts durations like "30d"/"24h" or ISO dates/timestamps; mtime can differ from indexed-content time on stale indexes. In hybrid mode, applied to lexical candidates before fusion. |
-| `context_before` | integer | no | min 0; max 5 | Opt-in neighbor context: include up to this many preceding chunks from the same source around each match before packing. Only supported with dense retrieval (search_mode="dense"); the default "auto" stays dense for prose. Defaults to 0. |
-| `context_after` | integer | no | min 0; max 5 | Opt-in neighbor context: include up to this many following chunks from the same source around each match before packing. Only supported with dense retrieval (search_mode="dense"); the default "auto" stays dense for prose. Defaults to 0. |
-| `context_window` | integer | no | min 0; max 5 | Shorthand for setting context_before and context_after to the same value. Only supported with dense retrieval (search_mode="dense"). Defaults to 0. |
+| `context_before` | integer | no | min 0; max 5 | Opt-in neighbor context: include up to this many preceding chunks from the same source around each match before packing. Supported with dense and hybrid retrieval, not lexical; an "auto" query that resolves to lexical is rejected. Defaults to 0. |
+| `context_after` | integer | no | min 0; max 5 | Opt-in neighbor context: include up to this many following chunks from the same source around each match before packing. Supported with dense and hybrid retrieval, not lexical; an "auto" query that resolves to lexical is rejected. Defaults to 0. |
+| `context_window` | integer | no | min 0; max 5 | Shorthand for setting context_before and context_after to the same value. Supported with dense and hybrid retrieval, not lexical. Defaults to 0. |
 | `search_mode` | enum | no | one of: `dense`, `hybrid`, `lexical`, `auto` | Retrieval mode for the snippets fed to the answer LLM. "auto" (default) keeps dense for prose and upgrades code/error-token queries to hybrid; "dense" is FAISS-only; "hybrid" fuses FAISS + per-KB BM25 via Reciprocal Rank Fusion; "lexical" is BM25-only. See #206 + #732. |
 | `rerank` | enum | no | one of: `on`, `off` | Per-call RFC 019 cross-encoder reranker override for hybrid retrieval. Off by default; omit to use KB_RERANK. |
 | `task_context` | string | no | — | Optional task context passed to the answer prompt and relevance gate when enabled. |
@@ -127,6 +132,35 @@ Finds chunks semantically similar to an existing result ("more-like-this"), seed
 | `k` | integer | no | min 1; max 50 | Related results to return. Default 10. |
 | `threshold` | number | no | — | Maximum dense similarity score; lower = closer match. Default 2. |
 | `include_self` | boolean | no | — | Keep the seed chunk in the result set. Omitted/false excludes it (the default). |
+
+## `list_facets`
+
+Enumerates the frontmatter facet values that actually exist across a knowledge base, so a client can discover the valid vocabulary for the retrieve_knowledge / ask_knowledge `tags` filter instead of guessing. Walks every note, parses YAML frontmatter, and reports each facet's distinct values with per-note counts (a value is counted once per note; array facets count each element). Read-only. Returns a kb.tags.v1 JSON payload (schemaVersion, knowledgeBases, notesScanned, facets) identical to `kb tags --format=json`. Defaults to the tags/status/type facets across every KB; pass knowledge_base_name to scope to one KB or facet to report a single frontmatter key.
+
+| Field | Type | Required | Constraints | Description |
+| --- | --- | --- | --- | --- |
+| `knowledge_base_name` | string | no | — | Scope the facet scan to this knowledge base. Omit to aggregate across every KB (the default). |
+| `facet` | string | no | — | Report a single frontmatter key (any key) instead of the default tags/status/type set. |
+
+## `recommend_knowledge_base`
+
+Recommends which knowledge base ("shelf") — and which existing file inside it — best fits a topic, so an MCP client can route a search or an add_document write instead of guessing a shelf or scanning them all. Runs one cross-KB similarity search for the topic, picks the KB with the closest hit, and names the single best existing file in it. Read-only. Returns a kb.recommend.v1 JSON payload: recommended_kb, existing_target (the best file, or null when no file is within the confidence threshold), confidence (the match distance; lower = closer), and a confident boolean (true when an existing_target was found). Score and threshold semantics are identical to `kb where --format=json`; the CLI-only `kb remember` copy-paste is omitted. Defaults: k=20, threshold=1.0, across every KB; pass model_name to override the active embedding model for this call.
+
+| Field | Type | Required | Constraints | Description |
+| --- | --- | --- | --- | --- |
+| `topic` | string | yes | min 1 chars | The topic / one-line description to place. The server runs one cross-KB similarity search for this text and recommends the closest KB + file. |
+| `k` | integer | no | min 1; max 50 | Top-K cross-KB hits to consider when grouping. Default 20. |
+| `threshold` | number | no | min 0 | Confidence cutoff (a distance; lower = closer). A best-file score BELOW this is a high-confidence existing target; above it, no existing_target is returned. Default 1.0. |
+| `model_name` | string | no | — | Override the active embedding model for this call (RFC 013). Defaults to the active model. |
+
+## `export_citations`
+
+Exports a bibliography (BibTeX, CSL-JSON, plain text, or RIS) for one or more notes, turning retrieval results into citations without a separate terminal step. The selector matches `kb open`: a chunk id or kb:// URI from a prior retrieve_knowledge/find_related hit, or a KB-relative path such as "research/papers/example.md" (any line/chunk fragment identifies only the containing note). Pass an array of selectors to emit one merged bibliography — BibTeX/RIS records deduped by cite key, a single CSL-JSON array, or one text line per note; selectors resolve in order and any failure errors the whole call (no partial output). Citation fields come from each note's YAML frontmatter (authors/author, title, published/date, doi, url, arxiv_id); a note with missing or invalid frontmatter still yields a citation keyed from its path. Read-only and index-independent — it never consults the index or live KB services. Returns the formatted bibliography as text. Default format: bibtex.
+
+| Field | Type | Required | Constraints | Description |
+| --- | --- | --- | --- | --- |
+| `selector` | union | yes | — | The note(s) to cite: a chunk id (e.g. "alpha/papers/x.md#L42-L78") or kb:// URI from a prior retrieve_knowledge/find_related result, or a KB-relative path such as "research/papers/example.md" (a line/chunk fragment is accepted but only identifies the containing note). Pass an array of such selectors to emit ONE merged bibliography — BibTeX/RIS records concatenated and deduped by cite key, a single combined CSL-JSON array, or one text line per note. Selectors resolve in order; if any fails to resolve the whole call errors (no partial output), mirroring `kb cite`. |
+| `format` | enum | no | one of: `bibtex`, `csl-json`, `text`, `ris` | Output format for the citation(s). "bibtex" (default) emits BibTeX entries, "csl-json" a CSL-JSON array, "text" a one-line plain-text reference per note, "ris" RIS records for EndNote/Zotero/Mendeley/RefWorks import. |
 
 ## `add_document`
 

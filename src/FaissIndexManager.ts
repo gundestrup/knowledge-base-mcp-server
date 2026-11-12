@@ -17,6 +17,7 @@ import {
   writeChunkManifests,
   writeSidecarHashes,
 } from './file-ingest.js';
+import { purgeIndexDirPreservingLedgers } from './index-ledger-files.js';
 import { loadFile } from './loaders.js';
 import {
   FAISS_INDEX_PATH,
@@ -104,6 +105,7 @@ import { FaissStoreAdapter, type EmbeddedDocumentsBatch } from './faiss-store-ad
 import { HnswIndexAdapter } from './hnsw-index-adapter.js';
 import type { SearchIndexAdapter } from './search-index-adapter.js';
 import {
+  IngestQuarantineSnapshot,
   recordIngestFailure,
   recordIngestSuccess,
   shouldRetryIngest,
@@ -285,6 +287,12 @@ export interface UpdateIndexOptions {
 export interface InitializeOptions {
   readOnly?: boolean;
   strictReadOnly?: boolean;
+  /**
+   * Issue #1181 — permit a writer to rebuild over a persisted version it
+   * cannot use (configuration mismatch, unreadable). Only `kb reindex` sets
+   * this; every other writer gets a typed error instead of a silent rebuild.
+   */
+  allowRebuild?: boolean;
 }
 
 export type IndexUpdateSummaryStatus = 'success' | 'partial' | 'failed' | 'never_run';
@@ -786,12 +794,17 @@ export class FaissIndexManager {
       // RFC 013: no model-switch wipe at initialize time. Each model has its
       // own dir; a different provider+model goes to a different `models/<id>/`.
       // RFC 014: load via the new versioned layout if present, fall back to
-      // the legacy faiss.index/ directory otherwise. loadAtomic handles its
-      // own corruption recovery — only the FAILED layout is removed, never
-      // the other one (preserves legacy as rollback safety even when the
-      // versioned layout is corrupt, and vice versa).
+      // the legacy faiss.index/ directory otherwise.
+      //
+      // Issue #1179: a versioned index this process cannot use (other
+      // backend or index type, other HNSW tuning, load failure) never loses
+      // its `index` pointer. A writer gets null and rebuilds into a new
+      // version; a read-only load throws the reason instead of reporting a
+      // built index as "not built". Read-only loads also never remove a
+      // corrupt legacy faiss.index/ — only a writer about to rebuild may.
       this.faissIndex = await this.loadAtomic({
-        repairCorrupt: opts.strictReadOnly !== true,
+        repairCorrupt: !readOnly,
+        allowRebuild: opts.allowRebuild === true,
       });
       this.metadataSidecarAllowedForLoadedStore = true;
       this.metadataSidecarCache = null;
@@ -928,7 +941,9 @@ export class FaissIndexManager {
       const indexDir = path.join(kbPath, '.index');
       if (!(await pathExists(indexDir))) continue;
       try {
-        await fsp.rm(indexDir, { recursive: true, force: true });
+        // Keep the user-authored ledgers (feedback + quarantine); only derived
+        // sidecars are stale (#1190).
+        await purgeIndexDirPreservingLedgers(indexDir);
         purged.push(kb);
       } catch (err) {
         logger.warn(
@@ -1176,7 +1191,9 @@ export class FaissIndexManager {
    * `list_models` (model-resolution.ts:detectDowngradeHazard), so no marker
    * file is required — the filesystem is the single source of truth.
    */
-  private async loadAtomic(opts: { repairCorrupt?: boolean } = {}): Promise<SearchIndexAdapter | null> {
+  private async loadAtomic(
+    opts: { repairCorrupt?: boolean; allowRebuild?: boolean } = {},
+  ): Promise<SearchIndexAdapter | null> {
     if (this.indexBackend === 'hnsw') {
       if (this.hnswConfig === null) {
         throw new Error('HNSW index configuration was not initialized');
@@ -1187,6 +1204,7 @@ export class FaissIndexManager {
         config: this.hnswConfig,
         handleFsOperationError,
         repairCorrupt: opts.repairCorrupt,
+        allowRebuild: opts.allowRebuild,
       });
     }
     const store = await loadFaissStoreAtomic({
@@ -1196,6 +1214,7 @@ export class FaissIndexManager {
       handleFsOperationError,
       expectedIndexType: this.indexType === 'sq8' ? 'sq8' : 'flat',
       repairCorrupt: opts.repairCorrupt,
+      allowRebuild: opts.allowRebuild,
     });
     return store === null ? null : FaissStoreAdapter.fromStore(store);
   }
@@ -1206,7 +1225,8 @@ export class FaissIndexManager {
    * with a write mutation should already hold this manager's write lock.
    */
   async reloadPersistedIndex(): Promise<void> {
-    this.faissIndex = await this.loadAtomic();
+    // allowRebuild: this process already loaded (or is rebuilding) this store.
+    this.faissIndex = await this.loadAtomic({ allowRebuild: true });
     this.metadataSidecarAllowedForLoadedStore = true;
     this.metadataSidecarCache = null;
     this.metadataSidecarMissingLogged = false;
@@ -1498,6 +1518,8 @@ export class FaissIndexManager {
         runSummary.warnings.push(warning);
       }
     };
+    // One manifest read per KB per refresh instead of a lock + read per file.
+    const quarantineSnapshot = new IngestQuarantineSnapshot();
     const recordQuarantineFailure = async (
       kbPath: string,
       relativePath: string,
@@ -1521,12 +1543,13 @@ export class FaissIndexManager {
         });
       }
       try {
-        await recordIngestFailure({
+        const record = await recordIngestFailure({
           kbPath,
           relativePath,
           sourceHash,
           error,
         });
+        await quarantineSnapshot.set(kbPath, record);
       } catch (quarantineError: unknown) {
         logger.warn(
           `Could not update ingest quarantine for ${path.join(kbPath, relativePath)}: ` +
@@ -1539,7 +1562,7 @@ export class FaissIndexManager {
       relativePath: string,
     ): Promise<void> => {
       try {
-        await recordIngestSuccess(kbPath, relativePath);
+        await recordIngestSuccess(kbPath, relativePath, { snapshot: quarantineSnapshot });
       } catch (quarantineError: unknown) {
         logger.warn(
           `Could not clear ingest quarantine for ${path.join(kbPath, relativePath)}: ` +
@@ -1973,7 +1996,7 @@ export class FaissIndexManager {
         const retryDecision = await shouldRetryIngest(
           scan.knowledgeBasePath,
           scan.relativePath,
-          { sourceHash: scan.fileHash },
+          { sourceHash: scan.fileHash, snapshot: quarantineSnapshot },
         );
         if (!retryDecision.retry) {
           runSummary.files_skipped += 1;
@@ -2387,7 +2410,7 @@ export class FaissIndexManager {
             const retryDecision = await shouldRetryIngest(
               knowledgeBasePath,
               relativePath,
-              { sourceHash: fileHash },
+              { sourceHash: fileHash, snapshot: quarantineSnapshot },
             );
             if (!retryDecision.retry) {
               continue;

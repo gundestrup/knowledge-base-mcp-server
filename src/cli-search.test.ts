@@ -1,3 +1,4 @@
+import { beginCliRequestId, endCliRequestId } from './canonical-log.js';
 import * as fsp from 'fs/promises';
 import * as path from 'path';
 import { describe, expect, it, jest } from '@jest/globals';
@@ -538,6 +539,46 @@ describe('runSearch timing guard (#331)', () => {
       },
     };
   }
+
+  // Issue #1178 — only refresh-capable (writer) searches opt in to first-run
+  // model registration; the resolver rejects so the test needs no manager mocks.
+  describe('first-run model registration opt-in (issue #1178)', () => {
+    async function resolveOptions(args: string[], stdin?: string): Promise<unknown[]> {
+      const resolveActiveModel = jest.fn(async () => {
+        throw new Error('stop after resolve');
+      });
+      const deps = {
+        bootstrapLayout: jest.fn(async () => {}),
+        resolveActiveModel,
+        loadManagerForModel: jest.fn(),
+        loadWithJsonRetry: jest.fn(),
+      } as unknown as RunSearchDeps;
+      await captureSearchOutput(args, deps, stdin);
+      return resolveActiveModel.mock.calls.map((c) => (c as unknown[])[0]);
+    }
+
+    it.each([
+      [['q', '--refresh', '--mode=dense']],
+      [['q', '--refresh', '--mode=hybrid']],
+    ])('passes registerFirstModel=true for %j', async (args) => {
+      expect(await resolveOptions(args)).toEqual([expect.objectContaining({ registerFirstModel: true })]);
+    });
+
+    it.each([
+      [['q', '--mode=dense']],
+      [['q', '--mode=hybrid']],
+    ])('keeps read-only search from registering for %j', async (args) => {
+      expect(await resolveOptions(args)).toEqual([expect.objectContaining({ registerFirstModel: false })]);
+    });
+
+    it('passes registerFirstModel=true for a batch row with refresh', async () => {
+      const calls = await resolveOptions(
+        ['--batch-jsonl'],
+        JSON.stringify({ query: 'q', refresh: true }) + '\n',
+      );
+      expect(calls[0]).toEqual(expect.objectContaining({ registerFirstModel: true }));
+    });
+  });
 
   async function captureSearchOutput(
     args: string[],
@@ -1864,6 +1905,33 @@ describe('runSearch timing guard (#331)', () => {
     expect(manager.similaritySearch).not.toHaveBeenCalled();
   });
 
+  it('omits request_id when runSearch runs outside the CLI wrapper, e.g. in the daemon (#1197)', async () => {
+    const { deps } = makeDeps();
+    deps.resolveKnowledgeBaseDir = jest.fn(async () => {
+      throw new KBError('KB_NOT_FOUND', 'unknown KB');
+    });
+
+    const out = await captureSearchOutput(['query', '--kb=alpah', '--format=json'], deps);
+
+    expect(out.code).toBe(2);
+    expect(JSON.parse(out.stdout).error.code).toBe('KB_NOT_FOUND');
+    expect(JSON.parse(out.stdout)).not.toHaveProperty('request_id');
+  });
+
+  it('includes request_id in the JSON failure envelope when the CLI wrapper minted one (#1197)', async () => {
+    const { deps } = makeDeps();
+    deps.resolveKnowledgeBaseDir = jest.fn(async () => {
+      throw new KBError('KB_NOT_FOUND', 'unknown KB');
+    });
+    const requestId = beginCliRequestId();
+    try {
+      const out = await captureSearchOutput(['query', '--kb=alpah', '--format=json'], deps);
+      expect(JSON.parse(out.stdout).request_id).toBe(requestId);
+    } finally {
+      endCliRequestId();
+    }
+  });
+
   it('rejects an unknown KB in a batch JSONL row before retrieval', async () => {
     const { deps, manager } = makeDeps();
     const resolveKnowledgeBaseDir = jest.fn(async () => {
@@ -2148,6 +2216,40 @@ describe('runSearch timing guard (#331)', () => {
     expect(lexicalIndex.refresh).not.toHaveBeenCalled();
     expect(payload.retrievers.lexical).toMatchObject({ fetched: 1, refreshed: 0, failed: 0 });
     expect(payload.results[0]?.metadata.relativePath).toBe('alpha/warm.md');
+  });
+
+  it('expands hybrid results with neighbor context after fusion (#1220)', async () => {
+    const { deps, manager } = makeDeps();
+    manager.similaritySearch = jest.fn(async () => [{
+      pageContent: 'best match',
+      metadata: { source: '/kb/alpha/a.md', knowledgeBase: 'alpha', relativePath: 'alpha/a.md', chunkIndex: 0 },
+      score: 0.1,
+    }]);
+    const expand = jest.fn((...args: unknown[]) =>
+      (args[0] as Array<Record<string, unknown>>).map((r) => ({
+        ...r,
+        contextChunks: [{ pageContent: 'gold fact one chunk later', metadata: { chunkIndex: 1 }, contextDirection: 'after' }],
+      })),
+    );
+    (manager as unknown as { expandWithNeighborContext: jest.Mock }).expandWithNeighborContext = expand;
+    deps.listLexicalKbs = jest.fn(async () => []);
+
+    const out = await captureSearchOutput(
+      ['query', '--mode=hybrid', '--context-after=1', '--format=json', '--k=1', '--no-freshness'],
+      deps,
+    );
+
+    expect(out.code).toBe(0);
+    expect(out.stderr).not.toContain('only supported');
+    expect(expand).toHaveBeenCalledWith(expect.any(Array), { after: 1 });
+    expect(out.stdout).toContain('gold fact one chunk later');
+  });
+
+  it('still rejects neighbor context under --mode=lexical (#1220)', async () => {
+    const { deps } = makeDeps();
+    const out = await captureSearchOutput(['query', '--mode=lexical', '--context-window=1'], deps);
+    expect(out.code).toBe(2);
+    expect(out.stderr).toContain('neighbor context expansion is only supported with --mode=dense or --mode=hybrid');
   });
 
   it('uses --candidate-pool-k to filter a wide hybrid pool before rerank and JSON output', async () => {

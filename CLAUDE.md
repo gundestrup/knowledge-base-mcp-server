@@ -17,7 +17,7 @@ node build/index.js    # runs the server over stdio (clients launch it this way)
 ### Key architecture
 
 - **Transport:** `src/KnowledgeBaseServer.ts` starts stdio by default and can opt into SSE or streamable HTTP via `MCP_TRANSPORT`. HTTP/SSE mode requires `MCP_AUTH_TOKEN` and defaults to loopback.
-- **MCP tool surface:** tools are registered in `KnowledgeBaseServer.registerTools()`. Current tools include `list_knowledge_bases`, `retrieve_knowledge`, `ask_knowledge`, `list_models`, `kb_stats`, `diff_index`, `find_related`, `add_document`, `delete_document`, and `reindex_knowledge_base`.
+- **MCP tool surface:** tools are registered in `KnowledgeBaseServer.registerTools()`. Current tools include `list_knowledge_bases`, `retrieve_knowledge`, `ask_knowledge`, `list_models`, `kb_stats`, `diff_index`, `find_related`, `list_facets`, `recommend_knowledge_base`, `export_citations`, `add_document`, `delete_document`, and `reindex_knowledge_base`.
 - **CLI surface:** `src/cli.ts` is the `kb` dispatcher. Command-specific behavior lives in `src/cli-*.ts`; shared command-independent logic belongs in `*-core.ts` helpers.
 - **Embeddings:** `FaissIndexManager` is constructed for a concrete `(provider, modelName)` pair. Provider defaults come from `EMBEDDING_PROVIDER` plus provider-specific model env vars.
 - **Index layout:** `$FAISS_INDEX_PATH/active.txt` selects a model id. Each model stores metadata and versioned FAISS data under `$FAISS_INDEX_PATH/models/<model_id>/`. See `model-storage-layout.ts` (paths, sentinel) and `model-resolution.ts` (active-model resolution) — they decide and enforce this layout, so read them before changing any index path.
@@ -28,6 +28,7 @@ node build/index.js    # runs the server over stdio (clients launch it this way)
 
 - **TypeScript strict** (`tsconfig.json`). No `any` without justification.
 - **Conventional commits** — `feat:`, `fix(scope):`, `docs:`, `chore:` (see `git log` for prior style).
+- **PR body = the template.** Build every PR body from `.github/PULL_REQUEST_TEMPLATE.md` with the `kookr:check:*` marker rows kept verbatim and on one line; check a row only if you did it (do not tick `npm test` if you ran a narrower scope — say so and strike the row with a reason), otherwise strike it with a one-line reason. Pass it via `gh pr create --body-file <file>` (file inside the worktree) or a quoted heredoc, never inline `--body`, and preflight with `npm run pr-checklist -- <file>` (see `CONTRIBUTING.md`).
 - **RFCs** under `docs/rfcs/NNN-slug.md` for non-trivial design. Drafts are first-class; merging an RFC does not imply implementation — each implementation PR references the RFC it realises.
 
 ### Verification beyond `npm test`
@@ -62,6 +63,6 @@ Rationale: follow-up work evaporates the moment context is lost. An issue preser
 
 - **HuggingFace endpoint:** the default now routes through `router.huggingface.co/hf-inference/models/<model>/pipeline/feature-extraction` because HuggingFace retired the legacy `api-inference.huggingface.co/models/...` endpoint. `HUGGINGFACE_ENDPOINT_URL` overrides.
 - **Model-switch no longer wipes the active index:** multi-model support stores each `(provider, model)` under its own `models/<id>/` directory. `kb models add` builds additional models side by side; `kb models set-active` changes the default.
-- **OpenAI not exposed in `smithery.yaml`:** the code supports OpenAI, the Smithery schema does not (`enum: ["huggingface", "ollama"]`). Users deploying via Smithery cannot currently pick OpenAI — tracked for a separate fix.
+- **`smithery.yaml` parity:** `src/smithery-config.test.ts` pins the Smithery embedding-provider and transport enums to `CONFIG_SCHEMA`, checks every env var the command function sets is registered, and keeps the default data paths under the Docker image's non-root `USER` home. Update `smithery.yaml` alongside schema changes.
 - **Docs / agent skills** have historical design notes in `docs/rfcs/002-ai-skills-setup.md`, but this `CLAUDE.md`, `README.md`, and `docs/architecture/` are the current repo-facing entry points.
 - **KB-author guidance** — when writing notes the server is meant to retrieve, see `docs/authoring-knowledge.md`. It documents chunker constants, the frontmatter whitelist, content-boundary risk, and the dense vs. lexical vs. hybrid retrieval trade-offs an author can lean into.

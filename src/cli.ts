@@ -52,7 +52,7 @@ import { TAGS_HELP, runTags } from './cli-tags.js';
 import { VERIFY_HELP, runVerify } from './cli-verify.js';
 import { WHERE_HELP, runWhere } from './cli-where.js';
 import { daemonUrlFromEnv, tryRunDaemonCommand } from './daemon-client.js';
-import { emitCanonicalLog } from './canonical-log.js';
+import { beginCliRequestId, emitCanonicalLog, endCliRequestId } from './canonical-log.js';
 import { buildDaemonSearchArgs, resolveSearchPager } from './cli-pager.js';
 import { exitCodeDocs, formatExitCodesHelp } from './cli-exit-codes.js';
 import { closestSuggestion } from './cli-shared.js';
@@ -92,7 +92,7 @@ const SUBCOMMANDS: readonly Subcommand[] = [
   { name: 'ls',           summary: 'List ingestable documents in one or all knowledge bases.',                help: LS_HELP,           handler: runLs },
   { name: 'search',       summary: 'Semantic search across one or all knowledge bases.',                     help: SEARCH_HELP,       handler: runSearch },
   { name: 'open',         summary: 'Resolve a chunk id / kb:// URI / result path to its source file.',        help: OPEN_HELP,         handler: runOpen },
-  { name: 'cite',         summary: 'Export BibTeX or CSL-JSON from note frontmatter.',                       help: CITE_HELP,         handler: runCite },
+  { name: 'cite',         summary: 'Export a bibliography entry (BibTeX, CSL-JSON, text, or RIS) from note frontmatter.', help: CITE_HELP,         handler: runCite },
   { name: 'related',      summary: 'Find chunks related to an existing chunk id or kb:// URI.',               help: RELATED_HELP,      handler: runRelated },
   { name: 'backup',       summary: 'Create a checksum-validated active index snapshot.',                      help: BACKUP_HELP,       handler: runBackup },
   { name: 'restore',      summary: 'Validate and restore an index snapshot with an atomic swap.',             help: RESTORE_HELP,      handler: runRestore },
@@ -378,6 +378,7 @@ async function runSubcommandWithCanonicalLog(
   operation: () => Promise<number>,
 ): Promise<number> {
   const startedAt = Date.now();
+  const requestId = beginCliRequestId();
   try {
     const code = await operation();
     const searchExtra = target.name === 'search'
@@ -385,6 +386,7 @@ async function runSubcommandWithCanonicalLog(
       : {};
     emitCanonicalLog({
       process: 'cli',
+      request_id: requestId,
       cmd: `kb ${target.name}`,
       ...searchExtra,
       took_ms: Date.now() - startedAt,
@@ -397,6 +399,7 @@ async function runSubcommandWithCanonicalLog(
   } catch (error: unknown) {
     emitCanonicalLog({
       process: 'cli',
+      request_id: requestId,
       cmd: `kb ${target.name}`,
       took_ms: Date.now() - startedAt,
       error: {
@@ -405,6 +408,8 @@ async function runSubcommandWithCanonicalLog(
       },
     });
     throw error;
+  } finally {
+    endCliRequestId();
   }
 }
 

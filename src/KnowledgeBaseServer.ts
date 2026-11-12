@@ -40,10 +40,13 @@ import {
   ASK_KNOWLEDGE_DESCRIPTION,
   DELETE_DOCUMENT_DESCRIPTION,
   DIFF_INDEX_DESCRIPTION,
+  EXPORT_CITATIONS_DESCRIPTION,
   FIND_RELATED_DESCRIPTION,
   KB_STATS_DESCRIPTION,
+  LIST_FACETS_DESCRIPTION,
   LIST_KNOWLEDGE_BASES_DESCRIPTION,
   LIST_MODELS_DESCRIPTION,
+  RECOMMEND_KNOWLEDGE_BASE_DESCRIPTION,
   REINDEX_KNOWLEDGE_BASE_DESCRIPTION,
   RETRIEVE_KNOWLEDGE_DESCRIPTION,
 } from './config/mcp-descriptions.js';
@@ -52,8 +55,12 @@ import {
   ASK_KNOWLEDGE_INPUT,
   DELETE_DOCUMENT_INPUT,
   DIFF_INDEX_INPUT,
+  EXPORT_CITATIONS_INPUT,
   FIND_RELATED_INPUT,
+  LIST_FACETS_INPUT,
+  LIST_KNOWLEDGE_BASES_INPUT,
   KB_STATS_INPUT,
+  RECOMMEND_KNOWLEDGE_BASE_INPUT,
   REINDEX_KNOWLEDGE_BASE_INPUT,
   RETRIEVE_KNOWLEDGE_INPUT,
   toolAnnotations,
@@ -93,11 +100,28 @@ import {
   resolveKnowledgeBaseDir,
 } from './kb-fs.js';
 import { computeKbStats } from './kb-stats.js';
+import { listKnowledgeBaseDocuments } from './kb-document-listing.js';
+import {
+  buildFacetsJsonPayload,
+  collectTagsReport,
+  DEFAULT_FACETS,
+} from './facets-core.js';
 import {
   buildRelatedJsonPayload,
   findRelatedCore,
   parseRelatedTarget,
 } from './related-core.js';
+import {
+  formatCitations,
+  resolveCitationEntries,
+  type CiteFormat,
+} from './citation-core.js';
+import {
+  buildRecommendKbPayload,
+  decideWhere,
+  DEFAULT_CONFIDENCE_THRESHOLD as DEFAULT_RECOMMEND_CONFIDENCE_THRESHOLD,
+  DEFAULT_K as DEFAULT_RECOMMEND_K,
+} from './recommend-kb-core.js';
 import {
   listResources,
   readResource,
@@ -179,8 +203,8 @@ import { readBuildInfo } from './build-info.js';
 import { LexicalIndexCache } from './lexical-index-cache.js';
 
 const SERVER_NAME = 'knowledge-base-server';
-const SERVER_VERSION = '0.1.0';
 const SERVER_BUILD_INFO = readBuildInfo();
+const SERVER_VERSION = SERVER_BUILD_INFO.version;
 
 // Issue #795 — the SDK hands every tool callback a per-request `extra`
 // (RequestHandlerExtra) as its second argument. We thread it through the tool
@@ -519,11 +543,17 @@ export class KnowledgeBaseServer {
     // so MCP clients can gate auto-approval and confirm destructive writes. The
     // zero-arg readers use the SDK's (name, description, annotations, cb)
     // overload; shaped tools thread annotations through registerShapedTool.
-    mcp.tool(
+    // Issue #1159 — list_knowledge_bases now takes an optional include_counts
+    // flag, so it registers through registerShapedTool (which threads the input
+    // schema) rather than the zero-arg overload. The default call still sends no
+    // arguments and returns the historical bare-names array.
+    this.registerShapedTool(
+      mcp,
       'list_knowledge_bases',
       LIST_KNOWLEDGE_BASES_DESCRIPTION,
+      LIST_KNOWLEDGE_BASES_INPUT,
       toolAnnotations('list_knowledge_bases'),
-      async () => this.handleListKnowledgeBases()
+      this.handleListKnowledgeBases.bind(this)
     );
 
     this.registerShapedTool(
@@ -582,6 +612,39 @@ export class KnowledgeBaseServer {
       FIND_RELATED_INPUT,
       toolAnnotations('find_related'),
       this.handleFindRelated.bind(this)
+    );
+
+    // Issue #1151 — list_facets: read-only frontmatter-facet enumeration
+    // mirroring `kb tags`. Always registered (not ingest-gated).
+    this.registerShapedTool(
+      mcp,
+      'list_facets',
+      LIST_FACETS_DESCRIPTION,
+      LIST_FACETS_INPUT,
+      toolAnnotations('list_facets'),
+      this.handleListFacets.bind(this)
+    );
+
+    // Issue #1152 — recommend_knowledge_base: read-only topic→shelf routing
+    // mirroring `kb where`. Always registered (not ingest-gated).
+    this.registerShapedTool(
+      mcp,
+      'recommend_knowledge_base',
+      RECOMMEND_KNOWLEDGE_BASE_DESCRIPTION,
+      RECOMMEND_KNOWLEDGE_BASE_INPUT,
+      toolAnnotations('recommend_knowledge_base'),
+      this.handleRecommendKnowledgeBase.bind(this)
+    );
+
+    // Issue #1153 — export_citations: read-only, index-independent citation
+    // export mirroring `kb cite`. Always registered (not ingest-gated).
+    this.registerShapedTool(
+      mcp,
+      'export_citations',
+      EXPORT_CITATIONS_DESCRIPTION,
+      EXPORT_CITATIONS_INPUT,
+      toolAnnotations('export_citations'),
+      this.handleExportCitations.bind(this)
     );
 
     if (KB_INGEST_ENABLED) {
@@ -689,13 +752,40 @@ export class KnowledgeBaseServer {
     });
   }
 
-  private async handleListKnowledgeBases(): Promise<CallToolResult> {
+  private async handleListKnowledgeBases(
+    args: { include_counts?: boolean } = {},
+  ): Promise<CallToolResult> {
     return this.withCanonicalTool({ tool: 'list_knowledge_bases' }, async () => {
       try {
       const knowledgeBases = await listKnowledgeBases(KNOWLEDGE_BASES_ROOT_DIR);
+      if (args.include_counts !== true) {
+        const content: TextContent = {
+          type: 'text',
+          text: JSON.stringify(knowledgeBases, null, 2),
+        };
+        return { content: [content] };
+      }
+      // Issue #1159 — one filesystem walk across every shelf, then group the
+      // returned documents by KB so each name reports its ingestable-document
+      // count (an empty, or non-walkable, shelf defaults to 0). The name set is
+      // taken from listKnowledgeBases above so include_counts and the default
+      // output always agree on which shelves exist; listKnowledgeBaseDocuments
+      // only ever narrows that set (it drops symlinked/invalid dirs), so every
+      // name here is well-defined with a 0 fallback.
+      const { documents } = await listKnowledgeBaseDocuments({
+        rootDir: KNOWLEDGE_BASES_ROOT_DIR,
+      });
+      const counts = new Map<string, number>();
+      for (const document of documents) {
+        counts.set(document.kbName, (counts.get(document.kbName) ?? 0) + 1);
+      }
       const content: TextContent = {
         type: 'text',
-        text: JSON.stringify(knowledgeBases, null, 2),
+        text: JSON.stringify(
+          knowledgeBases.map((name) => ({ name, document_count: counts.get(name) ?? 0 })),
+          null,
+          2,
+        ),
       };
       return { content: [content] };
     } catch (error: unknown) {
@@ -739,6 +829,7 @@ export class KnowledgeBaseServer {
       const payload = await computeKbStats(manager, {
         knowledgeBaseName: args.knowledge_base_name,
         serverVersion: SERVER_VERSION,
+        serverCommit: SERVER_BUILD_INFO.commit,
         startedAt: this.startedAt,
         remoteTransportStats: this.getRemoteTransportStats(),
       });
@@ -942,6 +1033,172 @@ export class KnowledgeBaseServer {
       } catch (error: unknown) {
         const err = toError(error);
         logger.error('Error finding related chunks:', err);
+        if (err.stack) {
+          logger.error(err.stack);
+        }
+        return { content: [mcpErrorContent(err)], isError: true };
+      }
+    });
+  }
+
+  /**
+   * Issue #1151 — list_facets MCP handler. The read-only MCP equivalent of
+   * `kb tags`: enumerate the frontmatter facet values that actually exist so a
+   * client can discover the valid tags/status/type filter vocabulary accepted
+   * by retrieve_knowledge / ask_knowledge. A thin transport wrapper — it
+   * normalizes the optional scope/facet inputs and delegates the scan to the
+   * shared `collectTagsReport` (the same core `kb tags` uses), returning the
+   * byte-identical `kb.tags.v1` JSON payload. Does NOT touch the index: it
+   * reads notes straight off disk under KNOWLEDGE_BASES_ROOT_DIR.
+   */
+  private async handleListFacets(args: {
+    knowledge_base_name?: string;
+    facet?: string;
+  }): Promise<CallToolResult> {
+    // Normalize empty/whitespace-only inputs to "unset" so they fall back to
+    // the documented defaults (all KBs / tags-status-type) rather than scoping
+    // to a literal empty KB or facet name — the Zod fields are unbounded
+    // optional strings, so a client could send "". The CLI rejects an empty
+    // --kb / --facet outright; here we treat them as unset instead of erroring.
+    const knowledgeBaseName = args.knowledge_base_name !== undefined && args.knowledge_base_name.trim().length > 0
+      ? args.knowledge_base_name
+      : undefined;
+    const facet = args.facet !== undefined && args.facet.trim().length > 0
+      ? args.facet
+      : undefined;
+    const facets = facet !== undefined ? [facet] : [...DEFAULT_FACETS];
+
+    return this.withCanonicalTool({
+      tool: 'list_facets',
+      kb_scope: knowledgeBaseName ?? null,
+    }, async () => {
+      try {
+        // collectTagsReport resolves an unknown knowledge_base_name through
+        // resolveKnowledgeBaseDir, which throws KBError('KB_NOT_FOUND', …) —
+        // the same fail-closed contract the other tools use. mcpErrorContent
+        // preserves that code on the wire.
+        const report = await collectTagsReport({
+          rootDir: KNOWLEDGE_BASES_ROOT_DIR,
+          kbFilter: knowledgeBaseName,
+          facets,
+        });
+        const payload = buildFacetsJsonPayload(report);
+        return {
+          content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }],
+        };
+      } catch (error: unknown) {
+        const err = toError(error);
+        logger.error('Error listing facets:', err);
+        if (err.stack) {
+          logger.error(err.stack);
+        }
+        return { content: [mcpErrorContent(err)], isError: true };
+      }
+    });
+  }
+
+  /**
+   * Issue #1152 — recommend_knowledge_base MCP handler. The read-only MCP
+   * equivalent of `kb where`: route a topic to the best knowledge base and the
+   * best existing file inside it, so an MCP-only client can scope a search or
+   * pick an add_document destination without guessing a shelf. A thin transport
+   * wrapper — it loads a read-only manager for the active model, runs one
+   * cross-KB similarity search for the topic (no KB filter, like the CLI), and
+   * delegates the reduction + serialization to the shared `decideWhere` /
+   * `buildRecommendKbPayload` core so the score/threshold semantics are
+   * identical to `kb where --format=json`. The CLI-only `kb remember`
+   * copy-paste is omitted so the MCP tool stays a pure recommendation. Does NOT
+   * acquire the write lock or trigger an index update.
+   */
+  private async handleRecommendKnowledgeBase(args: {
+    topic: string;
+    k?: number;
+    threshold?: number;
+    model_name?: string;
+  }): Promise<CallToolResult> {
+    const k = args.k ?? DEFAULT_RECOMMEND_K;
+    // The `threshold` input is the CONFIDENCE cutoff applied by decideWhere, not
+    // a search-level distance cap: the cross-KB search always over-fetches with
+    // an infinite threshold and the confidence check is applied afterwards —
+    // exactly as `kb where` does.
+    const confidenceThreshold = args.threshold ?? DEFAULT_RECOMMEND_CONFIDENCE_THRESHOLD;
+
+    return this.withCanonicalTool({
+      tool: 'recommend_knowledge_base',
+      kb_scope: null,
+      k,
+      threshold: confidenceThreshold,
+    }, async () => {
+      try {
+        let activeModelId: string;
+        try {
+          activeModelId = await resolveActiveModel({ explicitOverride: args.model_name });
+        } catch (err) {
+          if (err instanceof ActiveModelResolutionError) {
+            return { content: [{ type: 'text', text: err.message }], isError: true };
+          }
+          throw err;
+        }
+
+        const manager = await this.createReadOnlyManagerForModel(activeModelId);
+        // No KB filter — we want the cross-KB ranking, like `kb where`.
+        const results = await manager.similaritySearch(
+          args.topic,
+          k,
+          Number.POSITIVE_INFINITY,
+        );
+        const decision = decideWhere(results, confidenceThreshold);
+        const payload = buildRecommendKbPayload(decision);
+        return {
+          content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }],
+        };
+      } catch (error: unknown) {
+        const err = toError(error);
+        logger.error('Error recommending a knowledge base:', err);
+        if (err.stack) {
+          logger.error(err.stack);
+        }
+        return { content: [mcpErrorContent(err)], isError: true };
+      }
+    });
+  }
+
+  /**
+   * Issue #1153 — export_citations MCP handler. The read-only MCP equivalent of
+   * `kb cite`: turn one retrieval selector (chunk id / kb:// URI / KB-relative
+   * path) into a bibliography entry from the note's YAML frontmatter. A thin
+   * transport wrapper — it delegates selector resolution, frontmatter parsing,
+   * and formatting to the SAME `resolveCitationEntry` / `formatCitation` the CLI
+   * uses, so the two surfaces produce byte-identical citations. Index- and
+   * service-independent: it reads exactly one note and never touches the index,
+   * the write lock, or an LLM. Errors mirror the shared resolution the CLI uses:
+   * a malformed selector surfaces as VALIDATION; an unknown knowledge base as
+   * KB_NOT_FOUND; a missing note at an otherwise valid path as a plain
+   * "path not found" error (stamped INTERNAL by mcpErrorContent, since
+   * resolveKbPath throws a non-KBError there). A note with missing/invalid
+   * frontmatter is NOT an error — it returns a citation keyed from the note
+   * path, exactly as `kb cite` does.
+   */
+  private async handleExportCitations(args: {
+    selector: string | string[];
+    format?: CiteFormat;
+  }): Promise<CallToolResult> {
+    const format: CiteFormat = args.format ?? 'bibtex';
+    // #1158 — `selector` accepts a single string (byte-identical to #1153) or an
+    // array; both resolve to one merged bibliography. Resolution is all-or-
+    // nothing and in order, so a malformed/unreadable selector surfaces the same
+    // VALIDATION/KB_NOT_FOUND/path-not-found error the single-selector call did.
+    const selectors = Array.isArray(args.selector) ? args.selector : [args.selector];
+
+    return this.withCanonicalTool({ tool: 'export_citations' }, async () => {
+      try {
+        const entries = await resolveCitationEntries(selectors);
+        return {
+          content: [{ type: 'text', text: formatCitations(entries, format) }],
+        };
+      } catch (error: unknown) {
+        const err = toError(error);
+        logger.error('Error exporting citation:', err);
         if (err.stack) {
           logger.error(err.stack);
         }
@@ -1202,7 +1459,9 @@ export class KnowledgeBaseServer {
         };
       }
       if (searchMode === 'hybrid' || searchMode === 'lexical') {
-        if (hasNeighborContext(neighborContext)) {
+        // Neighbour expansion needs the dense FAISS docstore, so it works for
+        // dense and hybrid; BM25-only (lexical) has no docstore to widen from.
+        if (searchMode === 'lexical' && hasNeighborContext(neighborContext)) {
           searchLatencyMetrics.record({
             mode: searchMode,
             status: 'error',
@@ -1214,7 +1473,7 @@ export class KnowledgeBaseServer {
               text: JSON.stringify({
                 error: {
                   code: 'VALIDATION',
-                  message: 'neighbor context expansion is only supported with dense retrieve_knowledge',
+                  message: 'neighbor context expansion is only supported with dense or hybrid retrieve_knowledge',
                 },
               }),
             }],
@@ -1245,6 +1504,7 @@ export class KnowledgeBaseServer {
           gateOverride,
           rerankOverride,
           k: effectiveK,
+          ...(neighborContext !== undefined ? { neighborContext } : {}),
         });
       }
 
@@ -1259,7 +1519,7 @@ export class KnowledgeBaseServer {
       // hard-fails with a registered-list hint if not on disk).
       let activeModelId: string;
       try {
-        activeModelId = await resolveActiveModel({ explicitOverride: modelNameOverride });
+        activeModelId = await resolveActiveModel({ explicitOverride: modelNameOverride, registerFirstModel: true });
       } catch (err) {
         if (err instanceof ActiveModelResolutionError) {
           searchLatencyMetrics.record({
@@ -1610,6 +1870,8 @@ export class KnowledgeBaseServer {
     rerankOverride?: RerankOverride;
     /** Issue #973 — retrieval top-K before fusion/rerank. Default 10. */
     k?: number;
+    /** Opt-in neighbour windows, applied after fusion + rerank + gate. */
+    neighborContext?: NeighborContextOptions;
   }): Promise<CallToolResult> {
     const { query, knowledgeBaseName, knowledgeBaseNames, modelNameOverride, filters, canonical, taskContext, gateOverride, rerankOverride } = input;
     const kbScope: string | null = knowledgeBaseName && knowledgeBaseName.length > 0
@@ -1622,7 +1884,7 @@ export class KnowledgeBaseServer {
     try {
       let activeModelId: string;
       try {
-        activeModelId = await resolveActiveModel({ explicitOverride: modelNameOverride });
+        activeModelId = await resolveActiveModel({ explicitOverride: modelNameOverride, registerFirstModel: true });
       } catch (err) {
         if (err instanceof ActiveModelResolutionError) {
           searchLatencyMetrics.record({
@@ -1776,6 +2038,11 @@ export class KnowledgeBaseServer {
       });
       const gateMs = Date.now() - gateStartedAt;
       ranked = gate.results;
+      if (input.neighborContext && hasNeighborContext(input.neighborContext) && degradedReason === null) {
+        // Expand after fusion + rerank + gate so context chunks never affect
+        // ranking. Skipped when the dense leg degraded (no FAISS docstore).
+        ranked = manager.expandWithNeighborContext(ranked as never, input.neighborContext) as never;
+      }
       emitRelevanceGateDecision({
         process: 'mcp',
         query,
@@ -2155,7 +2422,7 @@ export class KnowledgeBaseServer {
 
   private async warmActiveManager(): Promise<void> {
     try {
-      const activeId = await resolveActiveModel();
+      const activeId = await resolveActiveModel({ registerFirstModel: true });
       const manager = await this.managers.getOrCreate(activeId);
       if (manager.hasLoadedIndex) {
         logger.info(`Active FAISS index ${activeId} loaded; startup rebuild not needed`);

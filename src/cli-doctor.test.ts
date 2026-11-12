@@ -52,15 +52,27 @@ const OLLAMA_MODEL_ID = 'ollama__nomic-embed-text-latest';
 const OLLAMA_MODEL_NAME = 'nomic-embed-text:latest';
 const RERANK_MODEL = 'Xenova/ms-marco-MiniLM-L-6-v2';
 
-afterEach(() => {
+afterEach(async () => {
+  // freshDoctor() re-imports the module graph, and importing it runs
+  // initializeProjectConfig(), which copies config-file values into
+  // process.env. Undo that injection before restoring the original env so
+  // one test's config defaults cannot leak into the next (#1092).
+  const { resetProjectConfigForTests } = await import('./config/project-config.js');
+  resetProjectConfigForTests();
   for (const [key, value] of Object.entries(originalEnv)) {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
   }
 });
 
+// A trigger path whose parent (the OS temp dir) always exists, so the
+// reindex_trigger check grades 'warn' (file absent) rather than 'error'
+// (missing parent) no matter what a developer's config file sets (#1092).
+const DEFAULT_TEST_REINDEX_TRIGGER_PATH = path.join(os.tmpdir(), '.kb-doctor-test-trigger');
+
 async function freshDoctor(env: Record<string, string>): Promise<typeof import('./cli-doctor.js')> {
-  for (const [key, value] of Object.entries(env)) process.env[key] = value;
+  const merged = { REINDEX_TRIGGER_PATH: DEFAULT_TEST_REINDEX_TRIGGER_PATH, ...env };
+  for (const [key, value] of Object.entries(merged)) process.env[key] = value;
   jest.resetModules();
   return import('./cli-doctor.js');
 }
@@ -491,6 +503,49 @@ describe('kb doctor', () => {
       expect(json.stale_counts_by_kb.alpha.new_files).toBe(1);
       expect(json.quarantine_counts_by_kb.alpha).toBe(0);
       expect(json.last_index_update.saved).toBe(true);
+    } finally {
+      await fsp.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('names a missing index pointer and the newest version instead of "not built" (#1181)', async () => {
+    const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'kb-doctor-pointer-'));
+    try {
+      const rootDir = path.join(tempDir, 'kbs');
+      const faissDir = path.join(tempDir, '.faiss');
+      await fsp.mkdir(rootDir, { recursive: true });
+      const modelDir = await seedRegisteredModel(faissDir);
+      for (const [name, ageSec] of [['index.v8', 10], ['index.v38', 500]] as const) {
+        const dir = path.join(modelDir, name);
+        await fsp.mkdir(dir, { recursive: true });
+        await fsp.writeFile(path.join(dir, 'integrity.json'), JSON.stringify({
+          schema_version: 'kb.index-integrity.v1',
+          written_at: new Date(Date.now() - ageSec * 1000).toISOString(),
+          model_id: MODEL_ID,
+          index_type: 'flat',
+          files: {},
+        }));
+        const t = Date.now() / 1000 - ageSec;
+        await fsp.utimes(dir, t, t);
+      }
+
+      const { buildDoctorReport } = await freshDoctor({
+        KNOWLEDGE_BASES_ROOT_DIR: rootDir,
+        FAISS_INDEX_PATH: faissDir,
+        EMBEDDING_PROVIDER: 'huggingface',
+        HUGGINGFACE_MODEL_NAME: MODEL_NAME,
+        HUGGINGFACE_API_KEY: 'test-key',
+      });
+      const report = await buildDoctorReport({
+        backendHealthCheck: async () => ({ healthy: true, detail: 'backend ok' }),
+        llmEndpointProbe: healthyLlmProbe,
+      });
+
+      const check = report.checks.find((c: { name: string }) => c.name === 'index');
+      expect(check?.status).toBe('error');
+      expect(check?.detail).toContain('pointer is missing');
+      expect(check?.detail).toContain('newest: index.v8');
+      expect(check?.detail).toContain('kb verify --integrity --repair');
     } finally {
       await fsp.rm(tempDir, { recursive: true, force: true });
     }

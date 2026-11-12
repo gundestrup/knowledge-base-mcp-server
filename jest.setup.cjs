@@ -8,3 +8,9 @@
 // `testTimeout` config key is silently ignored. Fast, uninstrumented
 // `npm test` runs are unaffected — they still finish well under the cap.
 jest.setTimeout(30000);
+
+// Issue #1092 / #1180 — environment isolation (user-level kb config, HOME,
+// knowledge-base root, index directory, kb env vars) lives in
+// jest.global-setup.cjs. It has to run in the Jest parent process: edits to
+// `process.env` made here only reach the current test file's sandbox copy,
+// never the workers' real environment or the child processes tests spawn.

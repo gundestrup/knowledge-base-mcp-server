@@ -1,13 +1,17 @@
 import { describe, expect, it } from '@jest/globals';
 import {
+  captureProcessOutput,
   closestSuggestion,
   createVerbosityPrinter,
   extractVerbosity,
   formatKnowledgeBaseSuggestions,
+  loadWithJsonRetry,
   rankSuggestions,
   renderRecords,
 } from './cli-shared.js';
 import { levenshteinDistance as coreLevenshteinDistance } from './suggestion-core.js';
+import { KBError } from './errors.js';
+import type { FaissIndexManager } from './FaissIndexManager.js';
 
 describe('renderRecords', () => {
   it('quotes CSV fields using RFC-4180 escaping', () => {
@@ -122,5 +126,133 @@ describe('createVerbosityPrinter (issue #739)', () => {
     printer.diag('d\n');
     expect(lines).toEqual(['i\n', 'd\n']);
     expect(printer.isVerbose).toBe(true);
+  });
+});
+
+describe('loadWithJsonRetry (issue #1179)', () => {
+  function managerThatThrows(make: () => Error): { manager: FaissIndexManager; calls: () => number } {
+    let calls = 0;
+    const manager = {
+      initialize: async () => {
+        calls += 1;
+        throw make();
+      },
+    } as unknown as FaissIndexManager;
+    return { manager, calls: () => calls };
+  }
+
+  it('keeps the CORRUPT_INDEX code when the corrupt-index message mentions a JSON parse error', async () => {
+    const { manager, calls } = managerThatThrows(() => new KBError(
+      'CORRUPT_INDEX',
+      'Versioned FAISS index /x/index.v0 is corrupt or unreadable; read-only load will not repair it. ' +
+        'Underlying error: Unexpected token g in JSON at position 0',
+    ));
+
+    await expect(loadWithJsonRetry(manager)).rejects.toMatchObject({ code: 'CORRUPT_INDEX' });
+    expect(calls()).toBe(2);
+  });
+
+  it('still reports an unclassified repeated JSON parse failure as a concurrent write', async () => {
+    const { manager } = managerThatThrows(() => new SyntaxError('Unexpected end of JSON input'));
+
+    await expect(loadWithJsonRetry(manager)).rejects.toThrow(/mid-write/);
+  });
+});
+
+describe('captureProcessOutput concurrency (issue #1189)', () => {
+  const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+  function deferred() {
+    let resolve!: () => void;
+    const promise = new Promise<void>((r) => {
+      resolve = r;
+    });
+    return { promise, resolve };
+  }
+
+  async function overlap(finishFirstA: boolean) {
+    const gateA = deferred();
+    const gateB = deferred();
+    const a = captureProcessOutput(async () => {
+      process.stdout.write('A1;');
+      process.stderr.write('a-err1;');
+      await gateA.promise;
+      process.stdout.write('A2;');
+      process.stderr.write('a-err2;');
+      return 1;
+    });
+    await tick();
+    const b = captureProcessOutput(async () => {
+      process.stdout.write('B1;');
+      process.stderr.write('b-err1;');
+      await gateB.promise;
+      process.stdout.write('B2;');
+      process.stderr.write('b-err2;');
+      return 2;
+    });
+    await tick();
+    (finishFirstA ? gateA : gateB).resolve();
+    await tick();
+    (finishFirstA ? gateB : gateA).resolve();
+    return Promise.all([a, b]);
+  }
+
+  it.each([
+    ['arrival order', true],
+    ['reverse order', false],
+  ])('gives each overlapping capture only its own output (%s)', async (_label, firstA) => {
+    const [a, b] = await overlap(firstA);
+    expect(a).toEqual({ exitCode: 1, stdout: 'A1;A2;', stderr: 'a-err1;a-err2;' });
+    expect(b).toEqual({ exitCode: 2, stdout: 'B1;B2;', stderr: 'b-err1;b-err2;' });
+  });
+
+  it.each([
+    ['arrival order', true],
+    ['reverse order', false],
+  ])('restores the real stream after overlapping captures (%s)', async (_label, firstA) => {
+    const before = process.stdout.write;
+    const beforeErr = process.stderr.write;
+    await overlap(firstA);
+    expect(process.stdout.write).toBe(before);
+    expect(process.stderr.write).toBe(beforeErr);
+  });
+
+  it('passes writes outside any capture through to the real stream while a capture is active', async () => {
+    const gate = deferred();
+    const seen: string[] = [];
+    const realWrite = process.stdout.write;
+    process.stdout.write = ((chunk: unknown) => {
+      seen.push(String(chunk));
+      return true;
+    }) as typeof process.stdout.write;
+    try {
+      const capture = captureProcessOutput(async () => {
+        process.stdout.write('captured;');
+        await gate.promise;
+        return 0;
+      });
+      await tick();
+      // Issued from the test's own async context, not the capture's.
+      process.stdout.write('daemon-log;');
+      gate.resolve();
+      const result = await capture;
+      expect(result.stdout).toBe('captured;');
+      expect(seen).toEqual(['daemon-log;']);
+    } finally {
+      process.stdout.write = realWrite;
+    }
+  });
+
+  it('keeps sequential captures working', async () => {
+    const first = await captureProcessOutput(async () => {
+      process.stdout.write('one');
+      return 0;
+    });
+    const second = await captureProcessOutput(async () => {
+      process.stdout.write(Buffer.from('two'));
+      return 3;
+    });
+    expect(first).toEqual({ exitCode: 0, stdout: 'one', stderr: '' });
+    expect(second).toEqual({ exitCode: 3, stdout: 'two', stderr: '' });
   });
 });

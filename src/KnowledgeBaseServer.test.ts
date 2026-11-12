@@ -2,6 +2,7 @@ import * as fsp from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
 import { CompleteRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import { readBuildInfo } from './build-info.js';
 import type { SimilaritySearchTiming } from './FaissIndexManager.js';
 
 const initializeMock = jest.fn();
@@ -12,7 +13,7 @@ const similaritySearchMock = jest.fn();
 // then runs similaritySearch on the seed text. Default to "no seed found" so
 // tests that don't exercise find_related are unaffected.
 const findChunkByReferenceMock = jest.fn((..._args: unknown[]) => null as unknown);
-const expandWithNeighborContextMock = jest.fn((results: unknown) => results);
+const expandWithNeighborContextMock = jest.fn((results: unknown, _options?: unknown) => results);
 const hasLoadedIndexMock = jest.fn(() => true);
 // Issue #54 — kb_stats reads chunk_count + dim from the manager. Default to
 // an empty store so tests that don't care about stats still see a sane shape.
@@ -266,6 +267,62 @@ describe('KnowledgeBaseServer handlers', () => {
     // cannot pass by mere set-equality coincidence.
     expect(parsed).not.toContain('.hidden');
     expect(parsed).not.toContain('.config');
+  });
+
+  // Issue #1159 — include_counts: false / omitted preserves the bare-names array
+  // so 0.x clients are unaffected by the new opt-in argument.
+  it('handleListKnowledgeBases with include_counts=false returns the bare-names array', async () => {
+    const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'kb-server-counts-off-'));
+    await fsp.mkdir(path.join(tempDir, 'alpha'));
+    await fsp.writeFile(path.join(tempDir, 'alpha', 'one.md'), '# One\n');
+
+    process.env.KNOWLEDGE_BASES_ROOT_DIR = tempDir;
+    process.env.FAISS_INDEX_PATH = path.join(tempDir, '.faiss');
+    process.env.EMBEDDING_PROVIDER = 'huggingface';
+    process.env.HUGGINGFACE_API_KEY = 'test-key';
+
+    const server = await freshServer();
+    const result = await server['handleListKnowledgeBases']({ include_counts: false });
+
+    expect(result.isError).toBeUndefined();
+    expect(JSON.parse(result.content[0].text)).toEqual(['alpha']);
+  });
+
+  // Issue #1159 — include_counts: true returns one { name, document_count }
+  // object per shelf with a correct ingestable-document count; an empty shelf
+  // reports 0 and a nested document is counted by the recursive walk.
+  it('handleListKnowledgeBases with include_counts=true returns per-shelf document counts', async () => {
+    const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'kb-server-counts-on-'));
+    await fsp.mkdir(path.join(tempDir, 'alpha'));
+    await fsp.writeFile(path.join(tempDir, 'alpha', 'one.md'), '# One\n');
+    await fsp.writeFile(path.join(tempDir, 'alpha', 'two.md'), '# Two\n');
+    await fsp.mkdir(path.join(tempDir, 'beta')); // empty shelf -> 0
+    await fsp.mkdir(path.join(tempDir, 'gamma'));
+    await fsp.mkdir(path.join(tempDir, 'gamma', 'docs'));
+    await fsp.writeFile(path.join(tempDir, 'gamma', 'docs', 'deep.md'), '# Deep\n');
+
+    process.env.KNOWLEDGE_BASES_ROOT_DIR = tempDir;
+    process.env.FAISS_INDEX_PATH = path.join(tempDir, '.faiss');
+    process.env.EMBEDDING_PROVIDER = 'huggingface';
+    process.env.HUGGINGFACE_API_KEY = 'test-key';
+
+    const server = await freshServer();
+    const result = await server['handleListKnowledgeBases']({ include_counts: true });
+
+    expect(result.isError).toBeUndefined();
+    const parsed = JSON.parse(result.content[0].text) as Array<{ name: string; document_count: number }>;
+    const byName = new Map(parsed.map((entry) => [entry.name, entry.document_count]));
+    expect(byName).toEqual(
+      new Map([
+        ['alpha', 2],
+        ['beta', 0],
+        ['gamma', 1],
+      ]),
+    );
+    // The Map equality above already pins the full shape: a bare-string entry
+    // (the default output) would key the Map on undefined, and a stringified
+    // count would fail numeric deep-equality — so no separate typeof guard is
+    // needed to prove the { name, document_count } object shape.
   });
 
   // --- handleListModels (RFC 013 M3 §4.5) ----------------------------------
@@ -562,19 +619,76 @@ describe('KnowledgeBaseServer handlers', () => {
     expect(result.content[0].text).toContain('neighbor');
   });
 
-  it('handleRetrieveKnowledge rejects neighbor context for hybrid mode', async () => {
+  it('handleRetrieveKnowledge rejects neighbor context for lexical mode', async () => {
     await setRetrieveEnv();
 
     const server = await freshServer();
     const result = await server['handleRetrieveKnowledge']({
       query: 'q',
-      search_mode: 'hybrid',
+      search_mode: 'lexical',
       context_window: 1,
     });
 
     expect(result.isError).toBe(true);
     expect(JSON.parse(result.content[0].text).error.code).toBe('VALIDATION');
     expect(similaritySearchMock).not.toHaveBeenCalled();
+  });
+
+  it('handleRetrieveKnowledge expands neighbor context in hybrid mode (#1224)', async () => {
+    const tempDir = await setRetrieveEnv();
+    await fsp.mkdir(path.join(tempDir, 'alpha'), { recursive: true });
+    await fsp.writeFile(path.join(tempDir, 'alpha', 'doc.md'), 'HYBRID_NEIGHBOR_QUERY body');
+    updateIndexMock.mockResolvedValue(undefined);
+    similaritySearchMock.mockResolvedValue([{
+      pageContent: 'dense hit',
+      metadata: { source: '/kb/doc.md', chunkIndex: 1 },
+      score: 0.2,
+    }]);
+    expandWithNeighborContextMock.mockImplementation((results: unknown) => (results as any[]).map((r) => ({
+      ...r,
+      matchType: 'semantic',
+      semanticMatch: true,
+      contextChunks: [{
+        pageContent: 'HYBRID_NEIGHBOR_CONTEXT',
+        metadata: { source: '/kb/doc.md', chunkIndex: 2 },
+        matchType: 'context',
+        semanticMatch: false,
+        contextDirection: 'after',
+        contextDistance: 1,
+      }],
+    })));
+
+    const server = await freshServer();
+    const result = await server['handleRetrieveKnowledge']({
+      query: 'HYBRID_NEIGHBOR_QUERY',
+      knowledge_base_name: 'alpha',
+      search_mode: 'hybrid',
+      context_after: 1,
+    });
+
+    expect(result.isError).toBeUndefined();
+    expect(expandWithNeighborContextMock).toHaveBeenCalledTimes(1);
+    expect(expandWithNeighborContextMock.mock.calls[0][1]).toEqual({ before: 0, after: 1 });
+    expect(result.content[0].text).toContain('> _Mode: hybrid');
+    expect(result.content[0].text).toContain('HYBRID_NEIGHBOR_CONTEXT');
+  });
+
+  it('handleRetrieveKnowledge hybrid without a window never calls neighbor expansion (#1224)', async () => {
+    const tempDir = await setRetrieveEnv();
+    await fsp.mkdir(path.join(tempDir, 'alpha'), { recursive: true });
+    await fsp.writeFile(path.join(tempDir, 'alpha', 'doc.md'), 'HYBRID_PLAIN_QUERY body');
+    updateIndexMock.mockResolvedValue(undefined);
+    similaritySearchMock.mockResolvedValue([]);
+
+    const server = await freshServer();
+    const result = await server['handleRetrieveKnowledge']({
+      query: 'HYBRID_PLAIN_QUERY',
+      knowledge_base_name: 'alpha',
+      search_mode: 'hybrid',
+    });
+
+    expect(result.isError).toBeUndefined();
+    expect(expandWithNeighborContextMock).not.toHaveBeenCalled();
   });
 
   // --- handleKbStats (#54) -------------------------------------------------
@@ -619,8 +733,10 @@ describe('KnowledgeBaseServer handlers', () => {
     expect(payload.index_path).toBe(process.env.FAISS_INDEX_PATH);
     expect(payload.last_index_update.status).toBe('never_run');
     expect(payload.last_index_update.model_id).toBe('huggingface__BAAI-bge-small-en-v1.5');
-    expect(typeof payload.server.version).toBe('string');
-    expect(payload.server.version.length).toBeGreaterThan(0);
+    // Issue #1193 — must match the real build info, not a hardcoded literal.
+    const buildInfo = readBuildInfo();
+    expect(payload.server.version).toBe(buildInfo.version);
+    expect(payload.server.commit).toBe(buildInfo.commit);
     expect(typeof payload.server.uptime_ms).toBe('number');
     expect(payload.server.uptime_ms).toBeGreaterThanOrEqual(0);
   });
@@ -1870,6 +1986,449 @@ describe('KnowledgeBaseServer handlers', () => {
     );
     const payload = JSON.parse(result.content[0].text) as { scoped_kb: string | null };
     expect(payload.scoped_kb).toBe('alpha');
+  });
+
+  // --- handleListFacets (#1151) ---------------------------------------------
+
+  // Write a KB tree of markdown notes with YAML frontmatter under a fresh root
+  // so list_facets has real files to scan (it reads disk, not the index).
+  async function setFacetsEnv(
+    kbs: Record<string, Record<string, string>>,
+  ): Promise<string> {
+    const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'kb-server-facets-'));
+    process.env.KNOWLEDGE_BASES_ROOT_DIR = tempDir;
+    for (const [kb, notes] of Object.entries(kbs)) {
+      for (const [rel, body] of Object.entries(notes)) {
+        const full = path.join(tempDir, kb, rel);
+        await fsp.mkdir(path.dirname(full), { recursive: true });
+        await fsp.writeFile(full, body, 'utf-8');
+      }
+    }
+    return tempDir;
+  }
+
+  const note = (frontmatter: string, body = 'content\n'): string =>
+    `---\n${frontmatter}\n---\n${body}`;
+
+  it('handleListFacets returns a kb.tags.v1 payload with distinct values and per-note counts', async () => {
+    await setFacetsEnv({
+      alpha: {
+        'a.md': note('tags: [deploy, ops]\nstatus: draft\ntype: guide'),
+        'b.md': note('tags: [deploy]\nstatus: published'),
+      },
+    });
+
+    const server = await freshServer();
+    const result = await server['handleListFacets']({});
+
+    expect(result.isError).toBeUndefined();
+    const payload = JSON.parse(result.content[0].text) as {
+      schemaVersion: string;
+      knowledgeBases: string[];
+      notesScanned: number;
+      facets: Record<string, Array<{ value: string; count: number }>>;
+    };
+    expect(payload.schemaVersion).toBe('kb.tags.v1');
+    expect(payload.knowledgeBases).toEqual(['alpha']);
+    expect(payload.notesScanned).toBe(2);
+    // tags: deploy twice (count 2), ops once — sorted by count desc then value.
+    expect(payload.facets.tags).toEqual([
+      { value: 'deploy', count: 2 },
+      { value: 'ops', count: 1 },
+    ]);
+    // status: one draft, one published (count ties → value asc).
+    expect(payload.facets.status).toEqual([
+      { value: 'draft', count: 1 },
+      { value: 'published', count: 1 },
+    ]);
+    expect(payload.facets.type).toEqual([{ value: 'guide', count: 1 }]);
+  });
+
+  it('handleListFacets scopes to a single knowledge_base_name', async () => {
+    await setFacetsEnv({
+      alpha: { 'a.md': note('tags: [alpha-only]') },
+      beta: { 'b.md': note('tags: [beta-only]') },
+    });
+
+    const server = await freshServer();
+    const result = await server['handleListFacets']({ knowledge_base_name: 'beta' });
+
+    expect(result.isError).toBeUndefined();
+    const payload = JSON.parse(result.content[0].text) as {
+      knowledgeBases: string[];
+      facets: Record<string, Array<{ value: string; count: number }>>;
+    };
+    expect(payload.knowledgeBases).toEqual(['beta']);
+    expect(payload.facets.tags).toEqual([{ value: 'beta-only', count: 1 }]);
+  });
+
+  it('handleListFacets reports a single arbitrary facet when facet is given', async () => {
+    await setFacetsEnv({
+      alpha: {
+        'a.md': note('priority: high'),
+        'b.md': note('priority: high\ntags: [ignored]'),
+      },
+    });
+
+    const server = await freshServer();
+    const result = await server['handleListFacets']({ facet: 'priority' });
+
+    expect(result.isError).toBeUndefined();
+    const payload = JSON.parse(result.content[0].text) as {
+      facets: Record<string, Array<{ value: string; count: number }>>;
+    };
+    expect(Object.keys(payload.facets)).toEqual(['priority']);
+    expect(payload.facets.priority).toEqual([{ value: 'high', count: 2 }]);
+  });
+
+  it('handleListFacets fails closed with KB_NOT_FOUND for an unknown knowledge_base_name', async () => {
+    await setFacetsEnv({ alpha: { 'a.md': note('tags: [x]') } });
+
+    const server = await freshServer();
+    const result = await server['handleListFacets']({ knowledge_base_name: 'does-not-exist' });
+
+    expect(result.isError).toBe(true);
+    const payload = JSON.parse(result.content[0].text) as { error: { code: string } };
+    expect(payload.error.code).toBe('KB_NOT_FOUND');
+  });
+
+  it('handleListFacets normalizes empty/whitespace scope + facet to the all-KBs / default-facet set', async () => {
+    await setFacetsEnv({
+      alpha: { 'a.md': note('tags: [t1]\nstatus: draft') },
+      beta: { 'b.md': note('tags: [t2]') },
+    });
+
+    const server = await freshServer();
+
+    type FacetsPayload = {
+      knowledgeBases: string[];
+      facets: Record<string, Array<{ value: string; count: number }>>;
+    };
+    const parse = (r: { content: Array<{ text: string }> }): FacetsPayload =>
+      JSON.parse(r.content[0].text) as FacetsPayload;
+
+    // Each blank form — whitespace and bare empty string — must behave as "unset":
+    // scope → every KB (alpha + beta, sorted), facet → tags/status/type, with the
+    // real aggregated values (not merely the right keys).
+    for (const blank of ['   ', '']) {
+      const result = await server['handleListFacets']({ knowledge_base_name: blank, facet: blank });
+      expect(result.isError).toBeUndefined();
+      const payload = parse(result);
+      expect(payload.knowledgeBases).toEqual(['alpha', 'beta']);
+      expect(Object.keys(payload.facets)).toEqual(['tags', 'status', 'type']);
+      expect(payload.facets.tags).toEqual([
+        { value: 't1', count: 1 },
+        { value: 't2', count: 1 },
+      ]);
+      expect(payload.facets.status).toEqual([{ value: 'draft', count: 1 }]);
+      expect(payload.facets.type).toEqual([]);
+    }
+  });
+
+  // --- handleRecommendKnowledgeBase (#1152) ---------------------------------
+
+  it('handleRecommendKnowledgeBase routes a topic to the best KB + file and returns a kb.recommend.v1 payload', async () => {
+    await setRetrieveEnv();
+    // Cross-KB hits: beta has the single closest chunk, so it is the
+    // recommended shelf and its lowest-score file is the existing target.
+    similaritySearchMock.mockResolvedValue([
+      { pageContent: 'a', metadata: { knowledgeBase: 'alpha', relativePath: 'alpha/notes/x.md' }, score: 0.85 },
+      { pageContent: 'b', metadata: { knowledgeBase: 'beta', relativePath: 'beta/notes/y.md' }, score: 0.40 },
+      { pageContent: 'c', metadata: { knowledgeBase: 'beta', relativePath: 'beta/notes/z.md' }, score: 0.55 },
+    ]);
+
+    const server = await freshServer();
+    const result = await server['handleRecommendKnowledgeBase']({ topic: 'quarterly retro template', k: 5 });
+
+    expect(result.isError).toBeUndefined();
+    // The cross-KB search runs on the topic text with no KB filter and the
+    // search-level threshold is infinite (the confidence cutoff is applied
+    // afterwards by decideWhere) — identical to `kb where`.
+    expect(similaritySearchMock).toHaveBeenCalledWith(
+      'quarterly retro template',
+      5,
+      Number.POSITIVE_INFINITY,
+    );
+    const payload = JSON.parse(result.content[0].text) as {
+      schema_version: string;
+      recommended_kb: string | null;
+      existing_target: string | null;
+      confidence: number | null;
+      confident: boolean;
+    };
+    expect(payload).toEqual({
+      schema_version: 'kb.recommend.v1',
+      recommended_kb: 'beta',
+      existing_target: 'beta/notes/y.md',
+      confidence: 0.4,
+      confident: true,
+    });
+    // The CLI-only copy-paste is never on the MCP wire.
+    expect(result.content[0].text).not.toContain('suggested_invocation');
+    expect(result.content[0].text).not.toContain('kb remember');
+  });
+
+  it('handleRecommendKnowledgeBase withholds the existing_target (confident=false) when the closest file is above the threshold', async () => {
+    await setRetrieveEnv();
+    similaritySearchMock.mockResolvedValue([
+      { pageContent: 'a', metadata: { knowledgeBase: 'alpha', relativePath: 'alpha/notes/loose.md' }, score: 1.4 },
+    ]);
+
+    const server = await freshServer();
+    // threshold 1.0 (the default): 1.4 is above it → no high-confidence file.
+    const result = await server['handleRecommendKnowledgeBase']({ topic: 'something unrelated', threshold: 1.0 });
+
+    expect(result.isError).toBeUndefined();
+    const payload = JSON.parse(result.content[0].text) as {
+      recommended_kb: string | null;
+      existing_target: string | null;
+      confident: boolean;
+    };
+    expect(payload.recommended_kb).toBe('alpha');
+    expect(payload.existing_target).toBeNull();
+    expect(payload.confident).toBe(false);
+  });
+
+  it('handleRecommendKnowledgeBase returns an all-null recommendation when nothing is similar', async () => {
+    await setRetrieveEnv();
+    similaritySearchMock.mockResolvedValue([]);
+
+    const server = await freshServer();
+    const result = await server['handleRecommendKnowledgeBase']({ topic: 'empty corpus' });
+
+    expect(result.isError).toBeUndefined();
+    const payload = JSON.parse(result.content[0].text) as Record<string, unknown>;
+    expect(payload).toEqual({
+      schema_version: 'kb.recommend.v1',
+      recommended_kb: null,
+      existing_target: null,
+      confidence: null,
+      confident: false,
+    });
+  });
+
+  it('handleRecommendKnowledgeBase with model_name=<unregistered> returns isError: true with a resolution hint', async () => {
+    await setRetrieveEnv();
+    const server = await freshServer();
+    const result = await server['handleRecommendKnowledgeBase']({ topic: 't', model_name: 'ollama__not-here' });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('not registered');
+    // The bad model short-circuits before any search runs.
+    expect(similaritySearchMock).not.toHaveBeenCalled();
+  });
+
+  // --- handleExportCitations (#1153) ----------------------------------------
+
+  async function writeCiteNote(rootDir: string): Promise<void> {
+    await fsp.mkdir(path.join(rootDir, 'research', 'papers'), { recursive: true });
+    await fsp.writeFile(
+      path.join(rootDir, 'research', 'papers', 'paper.md'),
+      [
+        '---',
+        'title: Example Paper',
+        'authors:',
+        '  - Ada Lovelace',
+        'published: 1843-01-01',
+        'doi: doi:10.1000/example',
+        '---',
+        '',
+        '# Example Paper',
+        '',
+      ].join('\n'),
+    );
+  }
+
+  it('handleExportCitations resolves a KB-relative path and returns a BibTeX entry from frontmatter', async () => {
+    const tempDir = await setRetrieveEnv();
+    await writeCiteNote(tempDir);
+    const server = await freshServer();
+
+    const result = await server['handleExportCitations']({ selector: 'research/papers/paper.md' });
+
+    expect(result.isError).toBeFalsy();
+    const text = result.content[0].text as string;
+    // Default format is bibtex; a frontmatter DOI promotes @misc → @article.
+    expect(text).toBe(
+      [
+        '@article{lovelace-1843-example,',
+        '  author = {Ada Lovelace},',
+        '  title = {Example Paper},',
+        '  year = {1843},',
+        '  doi = {10.1000/example},',
+        '  note = {KB note: research/papers/paper.md},',
+        '}',
+      ].join('\n'),
+    );
+  });
+
+  it('handleExportCitations emits CSL-JSON when format=csl-json, resolving a kb:// URI selector', async () => {
+    const tempDir = await setRetrieveEnv();
+    await writeCiteNote(tempDir);
+    const server = await freshServer();
+
+    const result = await server['handleExportCitations']({
+      selector: 'kb://research/papers/paper.md',
+      format: 'csl-json',
+    });
+
+    expect(result.isError).toBeFalsy();
+    expect(JSON.parse(result.content[0].text as string)).toEqual([
+      {
+        id: 'lovelace-1843-example',
+        type: 'article-journal',
+        note: 'KB note: research/papers/paper.md',
+        title: 'Example Paper',
+        author: [{ literal: 'Ada Lovelace' }],
+        issued: { 'date-parts': [[1843, 1, 1]] },
+        DOI: '10.1000/example',
+      },
+    ]);
+  });
+
+  it('handleExportCitations emits a RIS record when format=ris (#1157)', async () => {
+    const tempDir = await setRetrieveEnv();
+    await writeCiteNote(tempDir);
+    const server = await freshServer();
+
+    const result = await server['handleExportCitations']({
+      selector: 'research/papers/paper.md',
+      format: 'ris',
+    });
+
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toBe(
+      [
+        'TY  - JOUR',
+        'TI  - Example Paper',
+        'AU  - Ada Lovelace',
+        'PY  - 1843',
+        'DO  - 10.1000/example',
+        'N1  - KB note: research/papers/paper.md',
+        'ER  - ',
+      ].join('\n'),
+    );
+  });
+
+  it('handleExportCitations returns a path-keyed citation when frontmatter is missing (not an error)', async () => {
+    const tempDir = await setRetrieveEnv();
+    await fsp.mkdir(path.join(tempDir, 'notes'), { recursive: true });
+    await fsp.writeFile(path.join(tempDir, 'notes', 'plain-note.md'), '# Plain note\n\nNo frontmatter here.\n');
+    const server = await freshServer();
+
+    const result = await server['handleExportCitations']({ selector: 'notes/plain-note.md', format: 'text' });
+
+    // Mirrors `kb cite` degrading gracefully: a note without citation
+    // frontmatter still yields a citation keyed from its path.
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toBe('[plainnote-nd-plainnote] KB note: notes/plain-note.md');
+  });
+
+  it('handleExportCitations surfaces a VALIDATION error for a malformed selector', async () => {
+    await setRetrieveEnv();
+    const server = await freshServer();
+
+    const result = await server['handleExportCitations']({ selector: 'not-a-reference' });
+
+    expect(result.isError).toBe(true);
+    const error = JSON.parse(result.content[0].text as string).error;
+    expect(error.code).toBe('VALIDATION');
+    expect(error.message).toContain("cannot parse reference 'not-a-reference'");
+  });
+
+  it('handleExportCitations returns a path-not-found (INTERNAL) error for a missing note at a valid KB path', async () => {
+    const tempDir = await setRetrieveEnv();
+    // The KB directory exists but the note does not: resolveKbPath throws a
+    // plain Error("path not found: …"), which mcpErrorContent stamps INTERNAL
+    // (not KB_NOT_FOUND — that is reserved for an unknown knowledge base).
+    await fsp.mkdir(path.join(tempDir, 'research'), { recursive: true });
+    const server = await freshServer();
+
+    const result = await server['handleExportCitations']({ selector: 'research/missing.md' });
+
+    expect(result.isError).toBe(true);
+    const error = JSON.parse(result.content[0].text as string).error;
+    expect(error.code).toBe('INTERNAL');
+    expect(error.message).toContain('path not found');
+  });
+
+  it('handleExportCitations surfaces KB_NOT_FOUND when the selector names an unknown knowledge base', async () => {
+    await setRetrieveEnv();
+    const server = await freshServer();
+
+    const result = await server['handleExportCitations']({ selector: 'no-such-kb/paper.md' });
+
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0].text as string).error.code).toBe('KB_NOT_FOUND');
+  });
+
+  it('handleExportCitations merges an array of selectors into one BibTeX block, deduped by key (#1158)', async () => {
+    const tempDir = await setRetrieveEnv();
+    await fsp.mkdir(path.join(tempDir, 'research', 'papers'), { recursive: true });
+    await fsp.writeFile(
+      path.join(tempDir, 'research', 'papers', 'a.md'),
+      ['---', 'title: Alpha', 'authors:', '  - Ada Lovelace', 'published: 1843', '---', ''].join('\n'),
+    );
+    await fsp.writeFile(
+      path.join(tempDir, 'research', 'papers', 'b.md'),
+      ['---', 'title: Beta', 'authors:', '  - Grace Hopper', 'published: 1952', '---', ''].join('\n'),
+    );
+    const server = await freshServer();
+
+    // a.md is listed twice; the repeated cite key collapses to a single entry.
+    const result = await server['handleExportCitations']({
+      selector: ['research/papers/a.md', 'research/papers/b.md', 'research/papers/a.md'],
+    });
+
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toBe(
+      [
+        '@misc{lovelace-1843-alpha,',
+        '  author = {Ada Lovelace},',
+        '  title = {Alpha},',
+        '  year = {1843},',
+        '  note = {KB note: research/papers/a.md},',
+        '}',
+        '',
+        '@misc{hopper-1952-beta,',
+        '  author = {Grace Hopper},',
+        '  title = {Beta},',
+        '  year = {1952},',
+        '  note = {KB note: research/papers/b.md},',
+        '}',
+      ].join('\n'),
+    );
+  });
+
+  it('handleExportCitations merges an array of selectors into one CSL-JSON array (#1158)', async () => {
+    const tempDir = await setRetrieveEnv();
+    await writeCiteNote(tempDir);
+    await fsp.writeFile(
+      path.join(tempDir, 'research', 'papers', 'other.md'),
+      ['---', 'title: Other Paper', 'authors:', '  - Grace Hopper', 'published: 1952', '---', ''].join('\n'),
+    );
+    const server = await freshServer();
+
+    const result = await server['handleExportCitations']({
+      selector: ['research/papers/paper.md', 'research/papers/other.md'],
+      format: 'csl-json',
+    });
+
+    expect(result.isError).toBeFalsy();
+    const parsed = JSON.parse(result.content[0].text as string) as Array<{ id: string }>;
+    expect(parsed.map((e) => e.id)).toEqual(['lovelace-1843-example', 'hopper-1952-otherpaper']);
+  });
+
+  it('handleExportCitations errors the whole array call when any selector fails (no partial output) (#1158)', async () => {
+    const tempDir = await setRetrieveEnv();
+    await writeCiteNote(tempDir);
+    const server = await freshServer();
+
+    const result = await server['handleExportCitations']({
+      selector: ['research/papers/paper.md', 'not-a-reference'],
+    });
+
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0].text as string).error.code).toBe('VALIDATION');
   });
 
   // --- handleRetrieveKnowledge ----------------------------------------------
@@ -3239,15 +3798,15 @@ describe('KnowledgeBaseServer handlers', () => {
   }
 
   // Issue #798 — every tool must advertise its advisory ToolAnnotations so MCP
-  // clients can gate auto-approval and confirm destructive writes. The seven
+  // clients can gate auto-approval and confirm destructive writes. The ten
   // readers are read-only; the three ingest-gated writes carry hand-reviewed
   // destructive/idempotent hints (delete is the only destructive one).
-  it('registers each of the 10 tools with the expected ToolAnnotations hints', async () => {
+  it('registers each of the 13 tools with the expected ToolAnnotations hints', async () => {
     await setRetrieveEnv();
     process.env.KB_INGEST_ENABLED = 'true';
     const server = await freshServer();
 
-    // All 10 tools present so we can assert the writes too.
+    // All 13 tools present so we can assert the writes too.
     expect(registeredToolNames(server)).toEqual(
       expect.arrayContaining([
         'list_knowledge_bases',
@@ -3257,6 +3816,9 @@ describe('KnowledgeBaseServer handlers', () => {
         'kb_stats',
         'diff_index',
         'find_related',
+        'list_facets',
+        'recommend_knowledge_base',
+        'export_citations',
         'add_document',
         'delete_document',
         'reindex_knowledge_base',
@@ -3271,6 +3833,9 @@ describe('KnowledgeBaseServer handlers', () => {
       'kb_stats',
       'diff_index',
       'find_related',
+      'list_facets',
+      'recommend_knowledge_base',
+      'export_citations',
     ]) {
       expect(annotationsOf(server, readOnlyTool)).toMatchObject({ readOnlyHint: true });
     }
@@ -3322,6 +3887,7 @@ describe('KnowledgeBaseServer handlers', () => {
       'list_models',
       'kb_stats',
       'diff_index',
+      'list_facets',
     ]));
     expect(tools).not.toContain('add_document');
     expect(tools).not.toContain('delete_document');
@@ -3349,7 +3915,7 @@ describe('KnowledgeBaseServer handlers', () => {
     const server = await freshServer();
 
     expect(describeOf(server, 'list_knowledge_bases')).toBe(
-      'Lists the available knowledge bases.'
+      'Lists the available knowledge bases. Returns a JSON array of knowledge-base names by default. Pass include_counts: true to instead return one object per shelf, { name, document_count }, where document_count is the number of ingestable documents on that shelf (0 for an empty shelf).'
     );
     expect(describeOf(server, 'retrieve_knowledge')).toBe(
       'Retrieves similar chunks from the knowledge base based on a query. Optionally, if a knowledge base is specified, only that one is searched; otherwise, all available knowledge bases are considered. By default, at most 10 documents are returned. Dense retrieval limits results to a similarity score of 2 by default; a different threshold can optionally be provided. Hybrid retrieval does not apply this threshold because both legs are over-fetched for fusion.'
@@ -3371,7 +3937,7 @@ describe('KnowledgeBaseServer handlers', () => {
     expect(describeOf(server, 'retrieve_knowledge')).toBe('custom retrieve desc');
     // list_knowledge_bases must not be affected by the retrieve override.
     expect(describeOf(server, 'list_knowledge_bases')).toBe(
-      'Lists the available knowledge bases.'
+      'Lists the available knowledge bases. Returns a JSON array of knowledge-base names by default. Pass include_counts: true to instead return one object per shelf, { name, document_count }, where document_count is the number of ingestable documents on that shelf (0 for an empty shelf).'
     );
   });
 
@@ -3400,7 +3966,7 @@ describe('KnowledgeBaseServer handlers', () => {
       'Retrieves similar chunks from the knowledge base based on a query. Optionally, if a knowledge base is specified, only that one is searched; otherwise, all available knowledge bases are considered. By default, at most 10 documents are returned. Dense retrieval limits results to a similarity score of 2 by default; a different threshold can optionally be provided. Hybrid retrieval does not apply this threshold because both legs are over-fetched for fusion.'
     );
     expect(describeOf(server, 'list_knowledge_bases')).toBe(
-      'Lists the available knowledge bases.'
+      'Lists the available knowledge bases. Returns a JSON array of knowledge-base names by default. Pass include_counts: true to instead return one object per shelf, { name, document_count }, where document_count is the number of ingestable documents on that shelf (0 for an empty shelf).'
     );
   });
 

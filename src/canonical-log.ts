@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from 'crypto';
-import { logger } from './logger.js';
+import { isCanonicalLoggingEnabled, logger } from './logger.js';
 import { KBError, ActiveModelResolutionError, type KBErrorCode } from './errors.js';
 import type { QueryCacheOutcome, QueryCacheTelemetry } from './query-cache.js';
 import { readKBSlowQueryMs } from './config/logging.js';
@@ -167,6 +167,31 @@ const CANONICAL_FIELD_ORDER: readonly (keyof CanonicalLogEvent)[] = [
 export function createCanonicalRequestId(): string {
   const now = Date.now().toString(36).padStart(8, '0');
   return `${now}${randomBytes(8).toString('hex')}`;
+}
+
+let currentCliRequestId: string | undefined;
+
+/**
+ * Mint the request id for the CLI invocation now running and remember it, so the
+ * command can surface the same id that its canonical log line will carry
+ * (issue #1197). Only the CLI wrapper in `cli.ts` calls this; the daemon and the
+ * MCP server never do, so there the id is simply absent from command output.
+ */
+export function beginCliRequestId(): string {
+  currentCliRequestId = createCanonicalRequestId();
+  return currentCliRequestId;
+}
+
+export function endCliRequestId(): void {
+  currentCliRequestId = undefined;
+}
+
+/**
+ * The id to show an operator, or undefined when none exists or canonical
+ * logging is disabled (an id with no log line to look up would only mislead).
+ */
+export function currentCliRequestIdForOutput(): string | undefined {
+  return isCanonicalLoggingEnabled() ? currentCliRequestId : undefined;
 }
 
 export function hashQuery(query: string): string {
@@ -339,6 +364,8 @@ function categoryForKBError(code: KBErrorCode): CanonicalErrorCategory {
   switch (code) {
     case 'INDEX_NOT_INITIALIZED':
     case 'CORRUPT_INDEX':
+    case 'INDEX_CONFIG_MISMATCH':
+    case 'INDEX_POINTER_MISSING':
       return 'indexing';
     case 'PROVIDER_AUTH':
       return 'configuration';
@@ -386,6 +413,8 @@ function isKBErrorCode(code: string): code is KBErrorCode {
     'REINDEX_LOCK_HELD',
     'REINDEX_BUDGET_EXCEEDED',
     'INSUFFICIENT_DISK_SPACE',
+    'INDEX_CONFIG_MISMATCH',
+    'INDEX_POINTER_MISSING',
   ].includes(code);
 }
 

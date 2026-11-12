@@ -7,6 +7,8 @@ import {
   describeKnowledgeBase,
   extractKbDescription,
   listKnowledgeBases,
+  listResolvableKnowledgeBases,
+  resolveKbPath,
   resolveKnowledgeBaseDir,
 } from './kb-fs.js';
 
@@ -150,5 +152,122 @@ describe('describeKnowledgeBase', () => {
     } finally {
       await fsp.rm(tempDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('listResolvableKnowledgeBases (#1167)', () => {
+  it('keeps addressable KB directories and skips non-addressable top-level entries', async () => {
+    const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'kb-fs-resolvable-'));
+    const rootDir = path.join(tempDir, 'kbs');
+    try {
+      await fsp.mkdir(path.join(rootDir, 'good'), { recursive: true });
+      await fsp.mkdir(path.join(rootDir, 'also'), { recursive: true });
+      await fsp.writeFile(path.join(rootDir, 'good', 'note.md'), '# Note\n', 'utf8');
+      // Kept: an in-root directory symlink alias still resolves, so it matches
+      // resolveKnowledgeBaseDir's acceptance (unlike the stricter
+      // resources/list inventory, which drops aliases).
+      await fsp.symlink(path.join(rootDir, 'good'), path.join(rootDir, 'alias'), 'dir');
+      // Skipped (KB_NOT_FOUND): a plain file, a dangling symlink, a symlink to a file.
+      await fsp.writeFile(path.join(rootDir, 'not-a-kb'), 'x', 'utf8');
+      await fsp.symlink(path.join(rootDir, 'missing'), path.join(rootDir, 'dangling'));
+      await fsp.symlink(path.join(rootDir, 'good', 'note.md'), path.join(rootDir, 'readme.md'));
+      // Skipped (VALIDATION): a directory symlink that escapes the root.
+      const outsideDir = path.join(tempDir, 'outside');
+      await fsp.mkdir(outsideDir, { recursive: true });
+      await fsp.symlink(outsideDir, path.join(rootDir, 'evil'), 'dir');
+
+      const out = (await listResolvableKnowledgeBases(rootDir)).sort();
+      expect(out).toEqual(['alias', 'also', 'good']);
+    } finally {
+      await fsp.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('propagates non-addressable errors that are not KB_NOT_FOUND/VALIDATION (ELOOP)', async () => {
+    const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'kb-fs-resolvable-loop-'));
+    const rootDir = path.join(tempDir, 'kbs');
+    try {
+      await fsp.mkdir(path.join(rootDir, 'good'), { recursive: true });
+      // A self-referential symlink makes stat() fail with ELOOP — a real error
+      // that must abort rather than be silently dropped.
+      await fsp.symlink('loop', path.join(rootDir, 'loop'));
+
+      await expect(listResolvableKnowledgeBases(rootDir)).rejects.toMatchObject({ code: 'ELOOP' });
+    } finally {
+      await fsp.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+});
+
+const itSymlink = process.platform === 'win32' ? it.skip : it;
+
+describe('resolveKbPath symlink confinement (#1191)', () => {
+  async function withKb<T>(fn: (ctx: { rootDir: string; kbDir: string; outside: string }) => Promise<T>): Promise<T> {
+    const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'kb-fs-symlink-'));
+    const rootDir = path.join(tempDir, 'kbs');
+    const kbDir = path.join(rootDir, 'kb');
+    const outside = path.join(tempDir, 'outside');
+    await fsp.mkdir(kbDir, { recursive: true });
+    await fsp.mkdir(outside, { recursive: true });
+    try {
+      return await fn({ rootDir, kbDir, outside });
+    } finally {
+      await fsp.rm(tempDir, { recursive: true, force: true });
+    }
+  }
+
+  itSymlink('rejects a dangling leaf symlink that points outside the KB', async () => {
+    await withKb(async ({ rootDir, kbDir, outside }) => {
+      await fsp.symlink(path.join(outside, 'new.md'), path.join(kbDir, 'link.md'));
+      await expect(
+        resolveKbPath(rootDir, 'kb', 'link.md', { mustExist: false }),
+      ).rejects.toMatchObject({ code: 'VALIDATION', message: expect.stringContaining('path escapes KB root') });
+    });
+  });
+
+  itSymlink('rejects a dangling leaf symlink even when it points inside the KB', async () => {
+    await withKb(async ({ rootDir, kbDir }) => {
+      await fsp.symlink(path.join(kbDir, 'not-yet.md'), path.join(kbDir, 'link.md'));
+      await expect(
+        resolveKbPath(rootDir, 'kb', 'link.md', { mustExist: false }),
+      ).rejects.toMatchObject({ code: 'VALIDATION', message: expect.stringContaining('dangling symlink') });
+    });
+  });
+
+  itSymlink('rejects a file symlink to an existing outside file (characterization)', async () => {
+    await withKb(async ({ rootDir, kbDir, outside }) => {
+      await fsp.writeFile(path.join(outside, 'secret.md'), 'x');
+      await fsp.symlink(path.join(outside, 'secret.md'), path.join(kbDir, 'link.md'));
+      await expect(
+        resolveKbPath(rootDir, 'kb', 'link.md', { mustExist: false }),
+      ).rejects.toMatchObject({ code: 'VALIDATION' });
+    });
+  });
+
+  itSymlink('rejects a new leaf under a directory symlink to outside (characterization)', async () => {
+    await withKb(async ({ rootDir, kbDir, outside }) => {
+      await fsp.symlink(outside, path.join(kbDir, 'dirlink'), 'dir');
+      await expect(
+        resolveKbPath(rootDir, 'kb', 'dirlink/new.md', { mustExist: false }),
+      ).rejects.toMatchObject({ code: 'VALIDATION' });
+    });
+  });
+
+  itSymlink('still allows a symlink whose existing target is inside the KB', async () => {
+    await withKb(async ({ rootDir, kbDir }) => {
+      await fsp.writeFile(path.join(kbDir, 'real.md'), 'x');
+      await fsp.symlink(path.join(kbDir, 'real.md'), path.join(kbDir, 'link.md'));
+      await expect(
+        resolveKbPath(rootDir, 'kb', 'link.md', { mustExist: false }),
+      ).resolves.toBe(path.join(kbDir, 'link.md'));
+    });
+  });
+
+  itSymlink('allows a plain not-yet-existing path', async () => {
+    await withKb(async ({ rootDir, kbDir }) => {
+      await expect(
+        resolveKbPath(rootDir, 'kb', 'sub/new.md', { mustExist: false }),
+      ).resolves.toBe(path.join(kbDir, 'sub', 'new.md'));
+    });
   });
 });

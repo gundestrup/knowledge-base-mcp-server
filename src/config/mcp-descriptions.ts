@@ -25,7 +25,7 @@ export const ASK_KNOWLEDGE_DESCRIPTION =
     : DEFAULT_ASK_KNOWLEDGE_DESCRIPTION;
 
 export const DEFAULT_LIST_KNOWLEDGE_BASES_DESCRIPTION =
-  'Lists the available knowledge bases.';
+  'Lists the available knowledge bases. Returns a JSON array of knowledge-base names by default. Pass include_counts: true to instead return one object per shelf, { name, document_count }, where document_count is the number of ingestable documents on that shelf (0 for an empty shelf).';
 export const LIST_KNOWLEDGE_BASES_DESCRIPTION =
   process.env.LIST_KNOWLEDGE_BASES_DESCRIPTION && process.env.LIST_KNOWLEDGE_BASES_DESCRIPTION.length > 0
     ? process.env.LIST_KNOWLEDGE_BASES_DESCRIPTION
@@ -65,6 +65,30 @@ export const DIFF_INDEX_DESCRIPTION =
 // Like diff_index, this reader carries no env-override knob.
 export const FIND_RELATED_DESCRIPTION =
   'Finds chunks semantically similar to an existing result ("more-like-this"), seeded by a chunk id or kb:// URI from a prior retrieve_knowledge hit rather than a text query. Resolves the seed chunk from the active index and runs dense similarity search on its text, excluding the seed itself by default. Read-only. Returns a kb.related.v1 JSON payload (seed, scoped_kb, related results). Defaults: k=10, threshold=2, scoped to the seed chunk\'s knowledge base; pass all_kbs=true to search every KB or include_self=true to keep the seed in the results.';
+
+// Issue #1153 / #1158 — export_citations: the MCP equivalent of `kb cite`. Turns
+// one retrieval selector — or an array of them — (chunk id / kb:// URI /
+// KB-relative path) into a ready bibliography from the notes' YAML frontmatter.
+// Index-independent and read-only; like diff_index / find_related it carries no
+// env-override knob.
+export const EXPORT_CITATIONS_DESCRIPTION =
+  'Exports a bibliography (BibTeX, CSL-JSON, plain text, or RIS) for one or more notes, turning retrieval results into citations without a separate terminal step. The selector matches `kb open`: a chunk id or kb:// URI from a prior retrieve_knowledge/find_related hit, or a KB-relative path such as "research/papers/example.md" (any line/chunk fragment identifies only the containing note). Pass an array of selectors to emit one merged bibliography — BibTeX/RIS records deduped by cite key, a single CSL-JSON array, or one text line per note; selectors resolve in order and any failure errors the whole call (no partial output). Citation fields come from each note\'s YAML frontmatter (authors/author, title, published/date, doi, url, arxiv_id); a note with missing or invalid frontmatter still yields a citation keyed from its path. Read-only and index-independent — it never consults the index or live KB services. Returns the formatted bibliography as text. Default format: bibtex.';
+
+// Issue #1151 — list_facets: the MCP equivalent of `kb tags`. Read-only
+// frontmatter-facet enumeration so an MCP-only client can discover the valid
+// tags/status/type filter vocabulary accepted by retrieve_knowledge /
+// ask_knowledge instead of guessing. Like diff_index/find_related, this reader
+// carries no env-override knob.
+export const LIST_FACETS_DESCRIPTION =
+  'Enumerates the frontmatter facet values that actually exist across a knowledge base, so a client can discover the valid vocabulary for the retrieve_knowledge / ask_knowledge `tags` filter instead of guessing. Walks every note, parses YAML frontmatter, and reports each facet\'s distinct values with per-note counts (a value is counted once per note; array facets count each element). Read-only. Returns a kb.tags.v1 JSON payload (schemaVersion, knowledgeBases, notesScanned, facets) identical to `kb tags --format=json`. Defaults to the tags/status/type facets across every KB; pass knowledge_base_name to scope to one KB or facet to report a single frontmatter key.';
+
+// Issue #1152 — recommend_knowledge_base: the MCP equivalent of `kb where`.
+// Read-only shelf routing so an MCP-only client can ask "which knowledge base
+// — and which file — best fits this topic?" before it searches or writes
+// (e.g. to pick an add_document destination). Like diff_index/find_related/
+// list_facets, this reader carries no env-override knob.
+export const RECOMMEND_KNOWLEDGE_BASE_DESCRIPTION =
+  'Recommends which knowledge base ("shelf") — and which existing file inside it — best fits a topic, so an MCP client can route a search or an add_document write instead of guessing a shelf or scanning them all. Runs one cross-KB similarity search for the topic, picks the KB with the closest hit, and names the single best existing file in it. Read-only. Returns a kb.recommend.v1 JSON payload: recommended_kb, existing_target (the best file, or null when no file is within the confidence threshold), confidence (the match distance; lower = closer), and a confident boolean (true when an existing_target was found). Score and threshold semantics are identical to `kb where --format=json`; the CLI-only `kb remember` copy-paste is omitted. Defaults: k=20, threshold=1.0, across every KB; pass model_name to override the active embedding model for this call.';
 
 // ---------------------------------------------------------------------------
 // MCP prompts surface (#642).

@@ -62,6 +62,8 @@ Use `npm run check` before opening a PR; it runs the TypeScript build, ESLint, t
 
 For local configuration, copy [`.env.example`](./.env.example) to `.env`. The template is generated from `CONFIG_SCHEMA`; after changing the schema, run `npm run docs:generate-env-example` and commit the result.
 
+When `check:fast` reports reference-doc drift (configuration, `.env.example`, CLI, MCP tools, loaders, error codes, embedding models, metrics, or benchmark results), run `npm run docs:generate` — it builds once, rewrites every generated reference doc, and leaves nothing to regenerate by hand — then commit the result.
+
 ## Local Git Hooks
 
 `npm run dev:setup` points git at the tracked [`.githooks/`](./.githooks/) directory (`git config core.hooksPath .githooks`). Two lifecycle hooks then run automatically:
@@ -78,6 +80,8 @@ Use `npm run lint` (`eslint src`) to run the type-aware ESLint gate, or `npm run
 The flat config lives in [`eslint.config.js`](./eslint.config.js). It seeds typescript-eslint's `recommendedTypeChecked` ruleset (scoped to `src/`, excluding tests) with the currently-failing rules disabled so the gate is green today. Those disabled rules are documented ratchet targets — follow-up PRs should fix the violations and re-enable rules one at a time.
 
 Use `npm test` for the local CI-parity test gate. It builds the TypeScript output first, then runs the Jest `parallel` project with four workers followed by the Jest `serial` project in-band. The scripts clear `LOG_FILE` so ambient local logging does not redirect canonical stderr assertions into a personal log file.
+
+Every Jest run, including a direct `npx jest`, is sandboxed by [`jest.global-setup.cjs`](./jest.global-setup.cjs). Before any test starts, it points `HOME`, `KNOWLEDGE_BASES_ROOT_DIR`, `FAISS_INDEX_PATH`, `XDG_CONFIG_HOME` and `XDG_STATE_HOME` at a throwaway directory under the OS temp directory. It also removes every inherited kb configuration variable (`EMBEDDING_PROVIDER`, `OLLAMA_*`, `LOG_FILE`, `KB_DAEMON_URL`, ...). The `KB_RUN_*` variables that opt into extra suites are kept. As a result, tests never write into your real knowledge bases or index, and a local run sees the same configuration as CI. A test that needs a configuration value sets it itself. `src/test-hermeticity.test.ts` fails if this isolation stops working, including for child processes that tests spawn.
 
 Use the project scripts when you need a narrower runner check:
 

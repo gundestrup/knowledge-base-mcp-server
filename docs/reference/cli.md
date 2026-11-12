@@ -19,7 +19,7 @@ The `kb` CLI exposes 40 commands.
 | [`kb backup`](#kb-backup) | Create a checksum-validated active index snapshot. |
 | [`kb cache`](#kb-cache) | Inspect and prune local cache surfaces. |
 | [`kb capture`](#kb-capture) | Run a command and append its stdout to a KB note as a fenced block. |
-| [`kb cite`](#kb-cite) | Export BibTeX or CSL-JSON from note frontmatter. |
+| [`kb cite`](#kb-cite) | Export a bibliography entry (BibTeX, CSL-JSON, text, or RIS) from note frontmatter. |
 | [`kb compare`](#kb-compare) | Side-by-side rank/score table for two embedding models. |
 | [`kb completion`](#kb-completion) | Generate shell completions for bash, zsh, fish, or powershell. |
 | [`kb config`](#kb-config) | Validate KB environment configuration. |
@@ -152,11 +152,19 @@ kb cache — inspect and prune local cache surfaces
 Usage:
   kb cache extracted-text [--max-age-days=<n>] [--max-size-mb=<n>] [--dry-run|--yes] [--format=md|json]
   kb cache extracted-text [--cache-dir=<path>] [--max-age-days=<n>] [--max-size-mb=<n>] [--dry-run|--yes]
+  kb cache contextual-prefaces [--dry-run|--yes] [--format=md|json]
 
 The extracted-text cache stores parsed PDF/HTML text under
 `${FAISS_INDEX_PATH}/extracted-text` (or `EXTRACTION_TEXT_CACHE_DIR`).
 By default this command is a read-only dry-run. Passing `--yes` applies the
 planned deletion, and deletion is limited to expected 64-hex `.txt` cache files.
+
+The contextual-prefaces surface prunes orphaned contextual-retrieval sidecars
+under `${FAISS_INDEX_PATH}/.contextual-prefaces`: those whose recorded source
+file no longer exists. It is a dry-run unless `--yes` is passed; `--yes` deletes
+exactly the listed sidecars under the sidecar lock. Sidecars that record no
+source, and sidecars of a KB whose directory is missing (possibly unmounted),
+are never deleted. The extracted-text limits do not apply to this surface.
 
 Options:
   --max-age-days=<n>    Mark entries whose mtime is at least this many days old.
@@ -172,6 +180,8 @@ Examples:
   kb cache extracted-text --max-age-days=30
   kb cache extracted-text --max-size-mb=512 --format=json
   kb cache extracted-text --max-age-days=30 --max-size-mb=512 --yes
+  kb cache contextual-prefaces --dry-run
+  kb cache contextual-prefaces --yes
 ```
 
 ## `kb capture`
@@ -221,19 +231,25 @@ Examples:
 
 ## `kb cite`
 
-Export BibTeX or CSL-JSON from note frontmatter.
+Export a bibliography entry (BibTeX, CSL-JSON, text, or RIS) from note frontmatter.
 
 ```text
-kb cite — export a bibliography entry from note frontmatter
+kb cite — export a bibliography from note frontmatter
 
 Usage:
-  kb cite <chunk-id|kb://uri|kb-relative-path> [--format=bibtex|csl-json|text]
+  kb cite <selector> [<selector> ...] [--format=bibtex|csl-json|text|ris]
 
-Reads one markdown note, extracts citation-oriented frontmatter fields, and
-prints a ready-to-paste bibliography entry. Accepted selector forms match
+Reads one or more markdown notes, extracts citation-oriented frontmatter
+fields, and prints a ready-to-paste bibliography. Accepted selector forms match
 `kb open`: a chunk id, a kb:// URI, or a KB-relative path such as
 `research/papers/example.md`. Line or chunk fragments are accepted but only
 identify the containing note; citation fields come from note frontmatter.
+
+Pass several selectors to emit ONE merged bibliography: BibTeX entries and RIS
+records are concatenated (deduped by cite key), CSL-JSON becomes a single
+combined array, and text prints one line per note. Selectors resolve in order
+and the command is all-or-nothing — the first selector that fails to resolve
+determines the exit code and no partial output is written.
 
 Recognized frontmatter fields:
   authors, author       String or string array. String values split on
@@ -247,8 +263,9 @@ Recognized frontmatter fields:
   arxiv_id              arXiv identifier, emitted as eprint/archive metadata.
 
 Options:
-  --format=bibtex|csl-json|text
-                        Output format (default: bibtex).
+  --format=bibtex|csl-json|text|ris
+                        Output format (default: bibtex). "ris" emits a RIS
+                        record for EndNote/Zotero/Mendeley/RefWorks import.
   --help, -h            Show this help.
 
 Environment:
@@ -263,6 +280,7 @@ Examples:
   kb cite arxiv-llm-inference/papers/recurrent-transformer.md
   kb cite kb://research/papers/example.md --format=csl-json
   kb cite research/papers/example.md#L12-L48 --format=text
+  kb cite research/papers/a.md research/papers/b.md --format=bibtex
 ```
 
 ## `kb compare`
@@ -563,6 +581,8 @@ Arguments:
   scaffold <query>      Emit a starter retrieval-eval fixture for query.
 
 Options:
+  --fixture=<path>      Fixture path as a flag, equivalent to the positional
+                        <fixture.yml|json>. Not supported for scaffold.
   --model=<id>          Override the active model for the run (RFC 013).
   --k=<int>             Top-K results per case (default: 10).
   --threshold=<float>   Max similarity score; lower = closer (default: 2).
@@ -909,13 +929,17 @@ Usage:
   kb llm status [--profile=<name>] [--format=md|json]
   kb llm probe [--endpoint=<url>] [--expect-provider=<provider>] [--expect-model=<model>]
   kb llm use-endpoint <url> [--profile=<name>]
-  kb llm install --profile=<name> --runner=llama-server --bin=<path> --model=<gguf-path> [--port=8091] [--ctx=32768] [--ngl=99] [--runner-arg=<arg>] [--start]
+  kb llm install --profile=<name> --runner=llama-server --bin=<path> --model=<gguf-path> [--port=8091] [--ctx=32768] [--ngl=99] [--keepalive=lease|always] [--runner-arg=<arg>] [--start]
   kb llm start [--profile=<name>]
   kb llm stop [--profile=<name>]
   kb llm restart [--profile=<name>]
   kb llm set-model --profile=<name> --model=<gguf-path> [--start]
   kb llm uninstall [--profile=<name>|--all]
   kb llm reap
+
+Options for `install`:
+  --keepalive=lease|always
+                        Lifetime policy for the managed runner (default: lease).
 
 External profiles are reuse-only. Stop, restart, uninstall, and reap never
 touch external services such as local-research-agent's llama-server.
@@ -964,6 +988,7 @@ Options:
   --summary             Aggregate the whole log into a diagnostics report.
   --request-id=<id>     Show canonical events for one request id.
   --query-sha=<hash>    Show canonical events for one query_sha256 value.
+  --query-sha256=<hash> Alias for --query-sha (matches the log field name).
   --help, -h            Show this help.
 
 Examples:
@@ -1027,7 +1052,7 @@ Usage:
   kb models list [--format=md|json|csv|tsv|ndjson]
   kb models add <provider> <model> [--index-type=flat|sq8|hnsw] [--yes] [--dry-run] [--recover]
   kb models set-active <id>
-  kb models remove <id>
+  kb models remove <id> [--yes] [--force-incomplete]
   kb models gc --dry-run [--format=json]
 
 Each model gets its own per-model FAISS index under
@@ -1066,6 +1091,11 @@ Options for `add`:
   --index-type=flat|sq8|hnsw
                         Select the search index type for this model. Default is
                         KB_INDEX_TYPE when set, otherwise flat.
+
+Options for `remove`:
+  --yes                 Skip the confirmation prompt (required without a TTY).
+  --force-incomplete    Allow removing a model directory left by an interrupted
+                        add (one with a `.adding` sentinel).
 
 Options for `gc`:
   --dry-run             Required. Print the cleanup plan; never delete.
@@ -1463,8 +1493,8 @@ Plan and collect read-only KB evidence packets.
 kb research — read-only KB evidence planning and collection
 
 Usage:
-  kb research plan "<question>" [--format=md|json] [--include-kb=<name>] [--exclude-kb=<name>] [--max-shelves=<n>]
-  kb research collect "<question>" --run-dir <path> [--format=md|json] [--include-kb=<name>] [--exclude-kb=<name>] [--max-shelves=<n>]
+  kb research plan "<question>" [--format=md|json] [--kb=<name>] [--include-kb=<name>] [--exclude-kb=<name>] [--max-shelves=<n>]
+  kb research collect "<question>" --run-dir <path> [--format=md|json] [--kb=<name>] [--include-kb=<name>] [--exclude-kb=<name>] [--max-shelves=<n>]
 
 The workflow is deterministic: it reads KB descriptions and stats, selects
 likely shelves and queries, then collect uses existing hybrid search. It does
@@ -1485,8 +1515,9 @@ Options:
   --run-dir=<path>      Same as above.
   --format=md|json      Output format (default: md).
   --k=<int>             Results per query/shelf search during collect (default: 5).
-  --kb=<name>           Include a shelf explicitly (alias for --include-kb).
-  --include-kb=<name>   Include a shelf explicitly; repeatable.
+  --kb=<name>           Restrict the plan to this shelf only (like "kb search --kb");
+                        repeatable. Disables auto-selection; use --include-kb to add.
+  --include-kb=<name>   Add a shelf on top of auto-selected shelves; repeatable.
   --exclude-kb=<name>   Exclude a shelf; repeatable.
   --max-shelves=<int>   Maximum automatically selected shelves (default: 5).
   --help, -h            Show this help.
@@ -1606,9 +1637,9 @@ Result tuning:
                         Requires --refresh or KB_RETRIEVAL_VIEWS at ingest time
                         to create section/metadata/summary view records.
   --context-before=<n>  Include up to n preceding chunks from the same source
-                        around each dense semantic match (0-5).
+                        around each dense or hybrid match (0-5).
   --context-after=<n>   Include up to n following chunks from the same source
-                        around each dense semantic match (0-5).
+                        around each dense or hybrid match (0-5).
   --context-window=<n>  Shorthand for --context-before=n --context-after=n.
   --no-cache            Bypass the query-embedding cache for this search.
   --gate                Run the relevance gate for this call even when
@@ -2029,7 +2060,7 @@ Run slow integrity checks for persisted indexes and sidecars.
 kb verify — deep consistency checks for persisted KB indexes
 
 Usage:
-  kb verify --integrity [--format=md|json] [--all-versions] [--model=<model_id>]
+  kb verify --integrity [--format=md|json] [--all-versions] [--model=<model_id>] [--repair]
 
 Runs a slow, read-only integrity audit over FAISS version directories,
 integrity manifests, docstore JSON, lexical chunk counts, per-file hash
@@ -2042,6 +2073,10 @@ Options:
                        instead of only the active version.
   --model=<model_id>   Verify a specific registered model. Defaults to the
                        active model resolution path.
+  --repair             Before auditing, re-point a missing `index` symlink at the
+                       newest index.vN whose integrity.json verifies. Holds the
+                       model's write lock; never touches an existing pointer or
+                       any version directory.
   --help, -h           Show this help.
 
 Exit codes:

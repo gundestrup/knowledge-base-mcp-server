@@ -135,6 +135,8 @@ KNOWLEDGE_BASES_ROOT_DIR=$HOME/knowledge_bases   # one subdirectory per knowledg
 EMBEDDING_PROVIDER=ollama                        # ollama | openai | huggingface
 ```
 
+**First run needs no extra step.** On a fresh index directory the MCP server registers the model your environment names (for example `ollama__nomic-embed-text`) as the active model when it starts, then embeds your notes. `kb search --refresh` does the same. After that, `kb models add` is only for *additional* models (see [Compare embedding models](#compare-embedding-models)); it is never required to get started, so `npx`-only and Smithery installs work without the `kb` command.
+
 Set these in your shell profile (`.bashrc`, `.zshrc`) or directly in your MCP client's config. Every recognised variable, with its default, accepted values, and validation constraints, is listed in [`docs/reference/configuration.md`](docs/reference/configuration.md); the operator-facing view of retrieval flags and rollout status is in [docs/feature-flags.md](docs/feature-flags.md). Copy [`.env.example`](./.env.example) to `.env` for local development.
 
 Run `kb config validate` to check your configuration before startup. It catches cross-variable mistakes as well as bad individual values — for example, `KB_CHUNK_OVERLAP` must be strictly less than `KB_CHUNK_SIZE`. `kb doctor` reports the same finding and exits non-zero when the pair is invalid.
@@ -259,6 +261,9 @@ Your client sees these tools (registered in `src/KnowledgeBaseServer.ts`):
 | `kb_stats` | Read-only corpus, index, model, cache, and transport statistics — useful for a health check without touching the index. |
 | `diff_index` | Compare retrieval results across two persisted index versions, to see what a rebuild actually changed. |
 | `find_related` | Read-only "more-like-this" expansion — given a chunk id or `kb://` URI from an earlier result, return the chunks most similar to that one, without re-running a text query. The MCP equivalent of the `kb related` CLI command. |
+| `list_facets` | Read-only frontmatter-facet enumeration — list the distinct `tags`/`status`/`type` values (with per-note counts) that actually exist, so a client can discover the valid vocabulary for the `tags` filter instead of guessing. The MCP equivalent of the `kb tags` CLI command. |
+| `recommend_knowledge_base` | Read-only shelf routing — given a topic, recommend which knowledge base (and which existing file inside it) best fits, so an agent can scope a search or pick an `add_document` destination instead of guessing a shelf or scanning them all. Returns the recommended KB, best file, match distance, and a confidence flag. The MCP equivalent of the `kb where` CLI command. |
+| `export_citations` | Read-only, index-independent citation export — given a chunk id, `kb://` URI, or KB-relative path, format the note's frontmatter as a BibTeX, CSL-JSON, plain-text, or RIS bibliography entry, so an agent can cite a retrieved passage without dropping to a terminal. The MCP equivalent of the `kb cite` CLI command. |
 | `add_document` | Write a text document into a KB through the guarded mutation path. |
 | `delete_document` | Delete a KB-relative document through the guarded mutation path. |
 | `reindex_knowledge_base` | Force a global rebuild, optionally validating a named KB first. |
@@ -390,7 +395,7 @@ kb search "INDEX_NOT_INITIALIZED" --mode=hybrid
 kb search "src/cli-search.ts" --mode=auto
 ```
 
-**Widening a match.** A chunk is roughly a thousand characters, so a good hit is often the middle of a longer thought. `--context-before`, `--context-after`, and `--context-window` attach the adjacent chunks from the same source to each dense match — more to read, but fewer follow-up queries. See [docs/search-neighbor-context.md](docs/search-neighbor-context.md) for the JSON shape and the tradeoffs.
+**Widening a match.** A chunk is roughly a thousand characters, so a good hit is often the middle of a longer thought. `--context-before`, `--context-after`, and `--context-window` attach the adjacent chunks from the same source to each dense or hybrid (including rerank) match — more to read, but fewer follow-up queries. See [docs/search-neighbor-context.md](docs/search-neighbor-context.md) for the JSON shape and the tradeoffs.
 
 ```bash
 kb search "runbook rollback" --context-window=1
@@ -569,7 +574,7 @@ kb superseded --kb=work
 kb promote alpha/docs/deploy.md   # review and update lifecycle frontmatter on one note
 kb stale-check --kb=work          # find path / URL references that no longer resolve
 kb quarantine list --kb=work      # inspect per-file ingest quarantine entries
-kb cite alpha/docs/deploy.md      # export BibTeX or CSL-JSON from note frontmatter
+kb cite alpha/docs/deploy.md      # export a citation (BibTeX, CSL-JSON, text, or RIS) from note frontmatter
 ```
 
 ### Compare embedding models

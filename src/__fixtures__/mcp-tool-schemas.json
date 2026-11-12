@@ -189,6 +189,40 @@
     ],
     "$schema": "http://json-schema.org/draft-07/schema#"
   },
+  "export_citations": {
+    "type": "object",
+    "properties": {
+      "selector": {
+        "anyOf": [
+          {
+            "type": "string",
+            "minLength": 1
+          },
+          {
+            "minItems": 1,
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        ]
+      },
+      "format": {
+        "type": "string",
+        "enum": [
+          "bibtex",
+          "csl-json",
+          "text",
+          "ris"
+        ]
+      }
+    },
+    "required": [
+      "selector"
+    ],
+    "$schema": "http://json-schema.org/draft-07/schema#"
+  },
   "find_related": {
     "type": "object",
     "properties": {
@@ -228,13 +262,55 @@
     },
     "$schema": "http://json-schema.org/draft-07/schema#"
   },
+  "list_facets": {
+    "type": "object",
+    "properties": {
+      "knowledge_base_name": {
+        "type": "string"
+      },
+      "facet": {
+        "type": "string"
+      }
+    },
+    "$schema": "http://json-schema.org/draft-07/schema#"
+  },
   "list_knowledge_bases": {
     "type": "object",
-    "properties": {}
+    "properties": {
+      "include_counts": {
+        "type": "boolean"
+      }
+    },
+    "$schema": "http://json-schema.org/draft-07/schema#"
   },
   "list_models": {
     "type": "object",
     "properties": {}
+  },
+  "recommend_knowledge_base": {
+    "type": "object",
+    "properties": {
+      "topic": {
+        "type": "string",
+        "minLength": 1
+      },
+      "k": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 50
+      },
+      "threshold": {
+        "type": "number",
+        "exclusiveMinimum": 0
+      },
+      "model_name": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "topic"
+    ],
+    "$schema": "http://json-schema.org/draft-07/schema#"
   },
   "reindex_knowledge_base": {
     "type": "object",

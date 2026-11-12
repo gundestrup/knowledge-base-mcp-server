@@ -30,6 +30,13 @@ export const KB_ERROR_CODES = [
   // so the run fails fast with an actionable "need ~X, have Y" message
   // instead of an ENOSPC partway through.
   'INSUFFICIENT_DISK_SPACE',
+  // Issue #1181 — a persisted index version exists but this process must not
+  // silently rebuild over it. INDEX_CONFIG_MISMATCH: the stored version was
+  // written for another backend/index type/HNSW tuning than the current
+  // environment. INDEX_POINTER_MISSING: index.vN/ directories exist but the
+  // `index` pointer is gone (repairable with `kb verify --integrity --repair`).
+  'INDEX_CONFIG_MISMATCH',
+  'INDEX_POINTER_MISSING',
 ] as const;
 
 export type KBErrorCode = (typeof KB_ERROR_CODES)[number];
@@ -45,6 +52,20 @@ export class KBError extends Error {
     this.cause = cause;
     Object.setPrototypeOf(this, new.target.prototype);
   }
+}
+
+/**
+ * True when a `KBError` means a candidate is not an addressable knowledge base
+ * and an UNSCOPED enumeration should skip it rather than abort: `KB_NOT_FOUND`
+ * (missing, dangling symlink, or a symlink/path that does not resolve to a
+ * directory) and `VALIDATION` (a symlink that resolves outside the root). Every
+ * other error — a non-KBError such as `ELOOP`/`EACCES`, or any other KBError
+ * code — is a real failure and must still propagate. Callers addressing a
+ * single KB by name must NOT swallow these: an explicit bad name still fails.
+ */
+export function isUnaddressableKbError(error: unknown): boolean {
+  return error instanceof KBError
+    && (error.code === 'KB_NOT_FOUND' || error.code === 'VALIDATION');
 }
 
 // Issue #1006 — moved from active-model.ts so logging primitives (e.g.

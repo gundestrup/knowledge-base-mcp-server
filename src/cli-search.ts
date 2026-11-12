@@ -142,6 +142,7 @@ import {
 import {
   canonicalGateStageRecord,
   canonicalRerankStageRecord,
+  currentCliRequestIdForOutput,
   degradationSummaryFields,
   hashQuery,
   type CanonicalLogInput,
@@ -248,9 +249,9 @@ Result tuning:
                         Requires --refresh or KB_RETRIEVAL_VIEWS at ingest time
                         to create section/metadata/summary view records.
   --context-before=<n>  Include up to n preceding chunks from the same source
-                        around each dense semantic match (0-${MAX_NEIGHBOR_CONTEXT_WINDOW}).
+                        around each dense or hybrid match (0-${MAX_NEIGHBOR_CONTEXT_WINDOW}).
   --context-after=<n>   Include up to n following chunks from the same source
-                        around each dense semantic match (0-${MAX_NEIGHBOR_CONTEXT_WINDOW}).
+                        around each dense or hybrid match (0-${MAX_NEIGHBOR_CONTEXT_WINDOW}).
   --context-window=<n>  Shorthand for --context-before=n --context-after=n.
   --no-cache            Bypass the query-embedding cache for this search.
   --gate                Run the relevance gate for this call even when
@@ -599,8 +600,8 @@ export async function runSearch(
       return reportFailure(classifyKbSearchError(err), parsed.format);
     }
   }
-  if (hasNeighborContext(parsed) && effectiveMode !== 'dense') {
-    process.stderr.write('kb search: neighbor context expansion is only supported with --mode=dense\n');
+  if (hasNeighborContext(parsed) && effectiveMode !== 'dense' && effectiveMode !== 'hybrid') {
+    process.stderr.write('kb search: neighbor context expansion is only supported with --mode=dense or --mode=hybrid\n');
     return 2;
   }
   if (hasRecencyFilter(parsed) && effectiveMode !== 'dense' && effectiveMode !== 'hybrid') {
@@ -670,7 +671,10 @@ export async function runSearch(
   let activeModelId: string;
   try {
     const startedAt = nowMs();
-    activeModelId = await deps.resolveActiveModel({ explicitOverride: parsed.model });
+    activeModelId = await deps.resolveActiveModel({
+      explicitOverride: parsed.model,
+      registerFirstModel: parsed.refresh,
+    });
     if (timing) timing.model_resolution_ms = elapsedMs(startedAt);
   } catch (err) {
     return reportFailure(classifyKbSearchError(err), parsed.format);
@@ -1771,6 +1775,8 @@ export function buildDenseSearchJsonPayload(input: DenseSearchJsonPayloadInput):
   if (retrievalViews !== null) payload.retrieval_views = retrievalViews;
   if (input.timing) {
     payload.timing = compactTimingPayload(input.timing);
+    const requestId = currentCliRequestIdForOutput();
+    if (requestId !== undefined) payload.request_id = requestId;
   }
   return payload;
 }
@@ -2066,6 +2072,12 @@ function createQueryDecompositionProvider(
   return fallback;
 }
 
+/** `{ request_id }` when this invocation has a canonical id to show, else `{}`. */
+function requestIdField(): { request_id?: string } {
+  const requestId = currentCliRequestIdForOutput();
+  return requestId === undefined ? {} : { request_id: requestId };
+}
+
 function defaultBypassedGateVerdict(count: number): RelevanceGateVerdict {
   return {
     schema_version: RELEVANCE_GATE_SCHEMA_VERSION,
@@ -2080,10 +2092,11 @@ function defaultBypassedGateVerdict(count: number): RelevanceGateVerdict {
 }
 
 function reportFailure(failure: SearchFailure, format: SearchFormat): number {
+  const requestId = currentCliRequestIdForOutput();
   if (format === 'json') {
-    process.stdout.write(formatKbSearchFailureJson(failure));
+    process.stdout.write(formatKbSearchFailureJson(failure, requestId));
   } else {
-    process.stderr.write(formatKbSearchFailureStderr(failure));
+    process.stderr.write(formatKbSearchFailureStderr(failure, requestId));
   }
   return exitCodeForFailure(failure);
 }
@@ -2373,7 +2386,7 @@ async function resolveBatchActiveModel(
   const cached = cache.get(cacheKey);
   if (cached !== undefined) return cached;
   const startedAt = nowMs();
-  const activeModelId = await deps.resolveActiveModel({ explicitOverride: row.model });
+  const activeModelId = await deps.resolveActiveModel({ explicitOverride: row.model, registerFirstModel: row.refresh });
   cache.set(cacheKey, activeModelId);
   if (timing) timing.model_resolution_ms = elapsedMs(startedAt);
   return activeModelId;
@@ -2835,6 +2848,7 @@ async function runLexicalSearch(
         ? { retrieval_views: retrievalViewsJson(parsed.retrievalViews) }
         : {}),
       ...(parsed.timing && timing ? { timing: compactTimingPayload(timing) } : {}),
+      ...(parsed.timing && timing ? requestIdField() : {}),
     };
     process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
   } else if (parsed.format === 'vimgrep') {
@@ -2923,7 +2937,7 @@ async function runHybridSearch(
     await deps.bootstrapLayout();
     if (timing) timing.bootstrap_ms = elapsedMs(startedAt);
     startedAt = nowMs();
-    activeModelId = await deps.resolveActiveModel({ explicitOverride: parsed.model });
+    activeModelId = await deps.resolveActiveModel({ explicitOverride: parsed.model, registerFirstModel: parsed.refresh });
     if (timing) timing.model_resolution_ms = elapsedMs(startedAt);
   } catch (err) {
     return reportFailure(classifyKbSearchError(err), parsed.format);
@@ -3188,6 +3202,10 @@ async function runHybridSearch(
     return reportFailure(classifyKbSearchError(err), parsed.format);
   }
   ranked = ranked.slice(0, parsed.k);
+  if (parsed.neighborContext) {
+    // Expand after fusion + rerank + gate so context chunks never affect ranking.
+    ranked = manager.expandWithNeighborContext(ranked as never, parsed.neighborContext) as never;
+  }
   const rerankStage = canonicalRerankStageRecord(rerankResult);
   const gateStage = canonicalGateStageRecord(gateVerdict);
   const degradation = degradationSummaryFields({ rerank: rerankStage, gate: gateStage });
@@ -3260,6 +3278,7 @@ async function runHybridSearch(
       gate_verdict: gateVerdict,
       ...degradation,
       ...(parsed.timing && timing ? { timing: compactTimingPayload(timing) } : {}),
+      ...(parsed.timing && timing ? requestIdField() : {}),
     };
     process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
   } else if (parsed.format === 'vimgrep') {

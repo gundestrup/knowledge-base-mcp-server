@@ -170,10 +170,13 @@ function runKbCliSearch(
       'ask_knowledge',
       'delete_document',
       'diff_index',
+      'export_citations',
       'find_related',
       'kb_stats',
+      'list_facets',
       'list_knowledge_bases',
       'list_models',
+      'recommend_knowledge_base',
       'reindex_knowledge_base',
       'retrieve_knowledge',
     ]);
@@ -316,5 +319,27 @@ function runKbCliSearch(
     const mcpIdentities = parseMcpRetrievalIdentities(extractMcpMarkdownText(mcpResult));
 
     expect(mcpIdentities).toEqual(cliIdentities);
+  });
+
+  // Issue #1178 — a truly empty index directory (no models/, no active.txt)
+  // must not block the first search: the server registers the env-derived
+  // model on startup and the first dense retrieve succeeds.
+  it('serves a dense retrieve_knowledge from an empty index directory (first run, fake provider)', async () => {
+    harness = await startMcpBinaryHarness({
+      knowledgeBases: {
+        notes: { files: { 'deploy.md': '# Deploy\n\nHow to perform a rollback of a bad release.' } },
+      },
+      extraEnv: { EMBEDDING_PROVIDER: 'fake' },
+    });
+
+    const result = await harness.client.callTool({
+      name: 'retrieve_knowledge',
+      arguments: { query: 'rollback', knowledge_base_name: 'notes', gate: 'off' },
+    });
+    expect(result.isError).toBeFalsy();
+    expect(extractMcpMarkdownText(result)).toContain('rollback');
+    expect(await fsp.readdir(path.join(harness.faissIndexPath, 'models'))).toHaveLength(1);
+    expect((await fsp.readFile(path.join(harness.faissIndexPath, 'active.txt'), 'utf-8')).trim())
+      .toMatch(/^fake__/);
   });
 });

@@ -16,6 +16,7 @@ import {
   resolveKnowledgeBaseDir,
 } from './kb-fs.js';
 import { filterIngestablePaths } from './ingest-filter.js';
+import { isUnaddressableKbError } from './errors.js';
 import { isValidKbName } from './kb-paths.js';
 import { listIngestQuarantine } from './ingest-quarantine.js';
 import { getFilesRecursivelyWithDiagnostics } from './file-utils.js';
@@ -253,6 +254,17 @@ async function listKnowledgeBaseDirectories(rootDir: string): Promise<string[]> 
     } catch (error: unknown) {
       const code = (error as NodeJS.ErrnoException | undefined)?.code;
       if (code === 'ENOENT' || code === 'ENOTDIR') continue;
+      // A symlinked candidate that resolveKnowledgeBaseDir rejects is not an
+      // addressable KB: omit it from the inventory instead of letting one bad
+      // entry fail the whole listing (#1087, #1165). It rejects a top-level
+      // symlink that escapes the root (VALIDATION) or that does not resolve to
+      // a directory — dangling, or pointing at a file inside or outside the
+      // root (KB_NOT_FOUND). Both can only originate from the symlink branch
+      // above, so skipping them here never masks a non-symlink failure.
+      // Nothing is logged, so the symlink target never reaches logs. Any other
+      // error (for example ELOOP on a self-referential symlink) still
+      // propagates.
+      if (isUnaddressableKbError(error)) continue;
       throw error;
     }
   }

@@ -19,10 +19,13 @@ import {
   ASK_KNOWLEDGE_DESCRIPTION,
   DELETE_DOCUMENT_DESCRIPTION,
   DIFF_INDEX_DESCRIPTION,
+  EXPORT_CITATIONS_DESCRIPTION,
   FIND_RELATED_DESCRIPTION,
   KB_STATS_DESCRIPTION,
+  LIST_FACETS_DESCRIPTION,
   LIST_KNOWLEDGE_BASES_DESCRIPTION,
   LIST_MODELS_DESCRIPTION,
+  RECOMMEND_KNOWLEDGE_BASE_DESCRIPTION,
   REINDEX_KNOWLEDGE_BASE_DESCRIPTION,
   RETRIEVE_KNOWLEDGE_DESCRIPTION,
 } from './config/mcp-descriptions.js';
@@ -87,8 +90,8 @@ export const RETRIEVE_KNOWLEDGE_INPUT = {
   tags: boundedFilterArray().optional().describe('Limit results to chunks whose source file has ALL of these tags in its YAML frontmatter. In hybrid mode, applied to lexical candidates before fusion.'),
   since: z.string().optional().describe('Limit results to chunks whose current source-file mtime is at or after this bound. Accepts durations like "30d"/"24h" or ISO dates/timestamps; mtime can differ from indexed-content time on stale indexes. In hybrid mode, applied to lexical candidates before fusion.'),
   until: z.string().optional().describe('Limit results to chunks whose current source-file mtime is at or before this bound. Accepts durations like "30d"/"24h" or ISO dates/timestamps; mtime can differ from indexed-content time on stale indexes. In hybrid mode, applied to lexical candidates before fusion.'),
-  context_before: z.int().min(0).max(5).optional().describe('Opt-in neighbor context: include up to this many preceding chunks from the same source around each dense semantic match. Defaults to 0.'),
-  context_after: z.int().min(0).max(5).optional().describe('Opt-in neighbor context: include up to this many following chunks from the same source around each dense semantic match. Defaults to 0.'),
+  context_before: z.int().min(0).max(5).optional().describe('Opt-in neighbor context: include up to this many preceding chunks from the same source around each dense or hybrid match (not lexical). Defaults to 0.'),
+  context_after: z.int().min(0).max(5).optional().describe('Opt-in neighbor context: include up to this many following chunks from the same source around each dense or hybrid match (not lexical). Defaults to 0.'),
   context_window: z.int().min(0).max(5).optional().describe('Shorthand for setting context_before and context_after to the same value. Defaults to 0.'),
   // Issue #973 — bring ask_knowledge's configurable top-K to retrieve_knowledge.
   // Default 10 preserves the previously hardcoded value for 0.x clients.
@@ -127,12 +130,12 @@ export const ASK_KNOWLEDGE_INPUT = {
   since: z.string().optional().describe('Limit answer evidence to chunks whose current source-file mtime is at or after this bound. Accepts durations like "30d"/"24h" or ISO dates/timestamps; mtime can differ from indexed-content time on stale indexes. In hybrid mode, applied to lexical candidates before fusion.'),
   until: z.string().optional().describe('Limit answer evidence to chunks whose current source-file mtime is at or before this bound. Accepts durations like "30d"/"24h" or ISO dates/timestamps; mtime can differ from indexed-content time on stale indexes. In hybrid mode, applied to lexical candidates before fusion.'),
   // Issue #974 — opt-in neighbor windows, mirroring retrieve_knowledge. As on
-  // retrieve, expansion is only supported with dense retrieval (hybrid/lexical
-  // fusion has no stable neighbor ordering), so a window with a non-dense
-  // effective mode is a VALIDATION error. Defaults stay 0 (no expansion).
-  context_before: z.int().min(0).max(5).optional().describe('Opt-in neighbor context: include up to this many preceding chunks from the same source around each match before packing. Only supported with dense retrieval (search_mode="dense"); the default "auto" stays dense for prose. Defaults to 0.'),
-  context_after: z.int().min(0).max(5).optional().describe('Opt-in neighbor context: include up to this many following chunks from the same source around each match before packing. Only supported with dense retrieval (search_mode="dense"); the default "auto" stays dense for prose. Defaults to 0.'),
-  context_window: z.int().min(0).max(5).optional().describe('Shorthand for setting context_before and context_after to the same value. Only supported with dense retrieval (search_mode="dense"). Defaults to 0.'),
+  // retrieve, expansion is supported with dense and hybrid retrieval (applied
+  // after fusion/rerank), so a window with a lexical effective mode is a
+  // VALIDATION error. Defaults stay 0 (no expansion).
+  context_before: z.int().min(0).max(5).optional().describe('Opt-in neighbor context: include up to this many preceding chunks from the same source around each match before packing. Supported with dense and hybrid retrieval, not lexical; an "auto" query that resolves to lexical is rejected. Defaults to 0.'),
+  context_after: z.int().min(0).max(5).optional().describe('Opt-in neighbor context: include up to this many following chunks from the same source around each match before packing. Supported with dense and hybrid retrieval, not lexical; an "auto" query that resolves to lexical is rejected. Defaults to 0.'),
+  context_window: z.int().min(0).max(5).optional().describe('Shorthand for setting context_before and context_after to the same value. Supported with dense and hybrid retrieval, not lexical. Defaults to 0.'),
   // #732 — bring the search-mode + opt-in rerank surface of retrieve_knowledge
   // to the ask path. Defaults to 'auto' (prose stays dense, code/error-token
   // queries upgrade to hybrid); reranking stays opt-in.
@@ -191,6 +194,77 @@ export const FIND_RELATED_INPUT = {
     .describe('Keep the seed chunk in the result set. Omitted/false excludes it (the default).'),
 };
 
+// Issue #1151 — list_facets mirrors the read-only `kb tags` CLI: enumerate the
+// frontmatter facet values that exist so a client can learn the valid filter
+// vocabulary. Both inputs are optional, matching the CLI's all-KBs /
+// tags-status-type defaults. An empty/whitespace value is normalized to "unset"
+// by the handler rather than scoping to a literal empty KB / facet name.
+export const LIST_FACETS_INPUT = {
+  knowledge_base_name: z
+    .string()
+    .optional()
+    .describe('Scope the facet scan to this knowledge base. Omit to aggregate across every KB (the default).'),
+  facet: z
+    .string()
+    .optional()
+    .describe('Report a single frontmatter key (any key) instead of the default tags/status/type set.'),
+};
+
+// Issue #1152 — recommend_knowledge_base mirrors the read-only `kb where` CLI:
+// route a topic to the best KB + existing file. topic is the only required
+// input; k/threshold/model_name mirror the CLI's --k/--threshold/--model and
+// keep the same semantics (lower threshold distance = closer / stricter).
+export const RECOMMEND_KNOWLEDGE_BASE_INPUT = {
+  topic: z
+    .string()
+    .min(1, 'topic must not be empty')
+    .describe('The topic / one-line description to place. The server runs one cross-KB similarity search for this text and recommends the closest KB + file.'),
+  k: z.int().min(1).max(50).optional().describe('Top-K cross-KB hits to consider when grouping. Default 20.'),
+  threshold: z
+    .number()
+    .positive()
+    .optional()
+    .describe('Confidence cutoff (a distance; lower = closer). A best-file score BELOW this is a high-confidence existing target; above it, no existing_target is returned. Default 1.0.'),
+  model_name: z
+    .string()
+    .optional()
+    .describe('Override the active embedding model for this call (RFC 013). Defaults to the active model.'),
+};
+
+// Issue #1153 / #1158 — export_citations mirrors the read-only `kb cite` CLI:
+// turn one or more retrieval selectors into a bibliography from the notes'
+// frontmatter. Each selector matches `kb open` (chunk id / kb:// URI /
+// KB-relative path); format mirrors the CLI's --format. Index-independent — it
+// only reads the named notes. `selector` accepts either a single string (the
+// #1153 shape, byte-identical output) or an array of selectors (#1158) merged
+// into one bibliography.
+export const EXPORT_CITATIONS_INPUT = {
+  selector: z
+    .union([
+      z.string().min(1, 'selector must not be empty'),
+      z
+        .array(z.string().min(1, 'each selector must not be empty'))
+        .min(1, 'selector must not be empty'),
+    ])
+    .describe('The note(s) to cite: a chunk id (e.g. "alpha/papers/x.md#L42-L78") or kb:// URI from a prior retrieve_knowledge/find_related result, or a KB-relative path such as "research/papers/example.md" (a line/chunk fragment is accepted but only identifies the containing note). Pass an array of such selectors to emit ONE merged bibliography — BibTeX/RIS records concatenated and deduped by cite key, a single combined CSL-JSON array, or one text line per note. Selectors resolve in order; if any fails to resolve the whole call errors (no partial output), mirroring `kb cite`.'),
+  format: z
+    .enum(['bibtex', 'csl-json', 'text', 'ris'])
+    .optional()
+    .describe('Output format for the citation(s). "bibtex" (default) emits BibTeX entries, "csl-json" a CSL-JSON array, "text" a one-line plain-text reference per note, "ris" RIS records for EndNote/Zotero/Mendeley/RefWorks import.'),
+};
+
+// Issue #1159 — opt-in per-shelf document counts for list_knowledge_bases. The
+// single field is optional and defaults to false, so the historical bare-names
+// array stays the default output (0.x clients unaffected). When true, the
+// handler switches to one { name, document_count } object per shelf, counting
+// ingestable documents via a filesystem walk (an empty shelf reports 0).
+export const LIST_KNOWLEDGE_BASES_INPUT = {
+  include_counts: z
+    .boolean()
+    .optional()
+    .describe('When true, return one object per knowledge base as { name, document_count } instead of a bare array of names. document_count is the number of ingestable documents on that shelf (0 for an empty shelf), computed by a filesystem walk. Omitted/false keeps the default array-of-names output.'),
+};
+
 export const ADD_DOCUMENT_INPUT = {
   knowledge_base_name: z.string().describe('The name of the knowledge base to write into.'),
   path: z.string().describe('KB-relative document path to create or overwrite. Parent directories are created as needed.'),
@@ -230,7 +304,7 @@ export interface McpToolSpec {
   annotations: ToolAnnotations;
 }
 
-// Shared annotation objects. The seven readers do not modify their environment;
+// Shared annotation objects. The ten readers do not modify their environment;
 // per the MCP spec `destructiveHint`/`idempotentHint` are meaningful only when
 // `readOnlyHint === false`, so a lone `readOnlyHint: true` is the complete hint
 // for a reader.
@@ -239,7 +313,7 @@ const READ_ONLY_ANNOTATIONS: ToolAnnotations = { readOnlyHint: true };
 // Order mirrors registration in KnowledgeBaseServer.registerTools so the
 // generated doc reads top-to-bottom like the server surface.
 export const MCP_TOOL_SPECS: McpToolSpec[] = [
-  { name: 'list_knowledge_bases', description: LIST_KNOWLEDGE_BASES_DESCRIPTION, annotations: READ_ONLY_ANNOTATIONS },
+  { name: 'list_knowledge_bases', description: LIST_KNOWLEDGE_BASES_DESCRIPTION, inputShape: LIST_KNOWLEDGE_BASES_INPUT, annotations: READ_ONLY_ANNOTATIONS },
   { name: 'retrieve_knowledge', description: RETRIEVE_KNOWLEDGE_DESCRIPTION, inputShape: RETRIEVE_KNOWLEDGE_INPUT, annotations: READ_ONLY_ANNOTATIONS },
   { name: 'ask_knowledge', description: ASK_KNOWLEDGE_DESCRIPTION, inputShape: ASK_KNOWLEDGE_INPUT, annotations: READ_ONLY_ANNOTATIONS },
   { name: 'list_models', description: LIST_MODELS_DESCRIPTION, annotations: READ_ONLY_ANNOTATIONS },
@@ -247,6 +321,12 @@ export const MCP_TOOL_SPECS: McpToolSpec[] = [
   { name: 'diff_index', description: DIFF_INDEX_DESCRIPTION, inputShape: DIFF_INDEX_INPUT, annotations: READ_ONLY_ANNOTATIONS },
   // Issue #1133 — read-only seed-chunk "more-like-this" expansion mirroring `kb related`.
   { name: 'find_related', description: FIND_RELATED_DESCRIPTION, inputShape: FIND_RELATED_INPUT, annotations: READ_ONLY_ANNOTATIONS },
+  // Issue #1151 — read-only frontmatter-facet enumeration mirroring `kb tags`.
+  { name: 'list_facets', description: LIST_FACETS_DESCRIPTION, inputShape: LIST_FACETS_INPUT, annotations: READ_ONLY_ANNOTATIONS },
+  // Issue #1152 — read-only topic→shelf routing mirroring `kb where`.
+  { name: 'recommend_knowledge_base', description: RECOMMEND_KNOWLEDGE_BASE_DESCRIPTION, inputShape: RECOMMEND_KNOWLEDGE_BASE_INPUT, annotations: READ_ONLY_ANNOTATIONS },
+  // Issue #1153 — read-only, index-independent citation export mirroring `kb cite`.
+  { name: 'export_citations', description: EXPORT_CITATIONS_DESCRIPTION, inputShape: EXPORT_CITATIONS_INPUT, annotations: READ_ONLY_ANNOTATIONS },
   // add_document writes a document: not read-only, and additive rather than
   // destructive (it creates/overwrites a single path). Re-writing the same
   // path+content leaves the KB in the same state, so it is idempotent.
