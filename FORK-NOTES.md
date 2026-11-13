@@ -61,6 +61,13 @@ one-line reason — that is a valid waiver, not a failure. Evidence that
 doesn't live in a matching file (e.g. test assertions for a perf change)
 belongs in the waiver reason.
 
+The verifier's file matching is narrower than the row text implies:
+`tests` counts Jest `*.test.*` files only (shell harnesses like
+`plugins/swiftbar/test.sh` don't qualify), `readme` requires top-level
+`README.md` (plugin-local READMEs don't count). Strike the row even when
+you did the work, and name the real evidence in the reason — this failed
+CI on jeanibarz#1241 before the body was corrected.
+
 ## Local MCP server (launchd, HTTP transport)
 
 Devin/Windsurf sessions connect to ONE persistent server instead of
