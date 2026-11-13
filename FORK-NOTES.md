@@ -31,7 +31,7 @@ one-way snapshot.
 
 ## Currently excluded files
 
-- `.vscode/` — SonarLint connected-mode binding (personal connection id)
+- `.vscode/settings.json` — SonarLint connected-mode binding (personal connection id). Directory-level entry removed: upstream owns `.vscode/launch.json` (#1147).
 - `sonar-project.properties`, `.github/workflows/sonar.yml` — SonarQube
   Cloud project + `SONAR_TOKEN` belong to this fork's account
 - `FORK-ONLY`, `FORK-NOTES.md`, `scripts/prepare-upstream-branch.sh` —

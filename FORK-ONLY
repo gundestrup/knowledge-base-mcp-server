@@ -7,7 +7,9 @@
 
 # Personal SonarQube Cloud account — org key, project key, SONAR_TOKEN
 # are all bound to this fork's owner.
-.vscode/
+# NOTE: .vscode/settings.json only — upstream owns .vscode/launch.json (#1147);
+# listing the directory would strip an upstream file from PR branches.
+.vscode/settings.json
 sonar-project.properties
 .github/workflows/sonar.yml
 
