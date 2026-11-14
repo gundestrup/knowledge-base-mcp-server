@@ -1528,6 +1528,7 @@ export class FaissIndexManager {
       relativePath: string,
       sourceHash: string | null,
       error: unknown,
+      options: { modelScoped?: boolean } = {},
     ): Promise<void> => {
       if (error instanceof IngestSecretDetectedError) {
         emitCanonicalLog({
@@ -1551,6 +1552,8 @@ export class FaissIndexManager {
           relativePath,
           sourceHash,
           error,
+          modelId: this.modelId,
+          modelScoped: options.modelScoped,
         });
         await quarantineSnapshot.set(kbPath, record);
       } catch (quarantineError: unknown) {
@@ -1565,7 +1568,10 @@ export class FaissIndexManager {
       relativePath: string,
     ): Promise<void> => {
       try {
-        await recordIngestSuccess(kbPath, relativePath, { snapshot: quarantineSnapshot });
+        await recordIngestSuccess(kbPath, relativePath, {
+          snapshot: quarantineSnapshot,
+          modelId: this.modelId,
+        });
       } catch (quarantineError: unknown) {
         logger.warn(
           `Could not clear ingest quarantine for ${path.join(kbPath, relativePath)}: ` +
@@ -2003,7 +2009,7 @@ export class FaissIndexManager {
         const retryDecision = await shouldRetryIngest(
           scan.knowledgeBasePath,
           scan.relativePath,
-          { sourceHash: scan.fileHash, snapshot: quarantineSnapshot },
+          { sourceHash: scan.fileHash, snapshot: quarantineSnapshot, modelId: this.modelId },
         );
         if (!retryDecision.retry) {
           runSummary.files_skipped += 1;
@@ -2360,6 +2366,9 @@ export class FaissIndexManager {
           updateStartedAtMs: startedAtMs,
         });
       } catch (error: unknown) {
+        // Issue #1261 — the files were already loaded, chunked and scanned;
+        // this failure came from this model's embed/insert stage, so it must
+        // not block other models from indexing the same files.
         for (const entry of changedFileDocuments) {
           recordFailure(entry.relativePath, 'indexing', error);
           await recordQuarantineFailure(
@@ -2367,6 +2376,7 @@ export class FaissIndexManager {
             entry.relativePath,
             entry.fileHash,
             error,
+            { modelScoped: true },
           );
         }
         throw error;
@@ -2431,7 +2441,7 @@ export class FaissIndexManager {
             const retryDecision = await shouldRetryIngest(
               knowledgeBasePath,
               relativePath,
-              { sourceHash: fileHash, snapshot: quarantineSnapshot },
+              { sourceHash: fileHash, snapshot: quarantineSnapshot, modelId: this.modelId },
             );
             if (!retryDecision.retry) {
               continue;
@@ -2519,6 +2529,7 @@ export class FaissIndexManager {
             },
           );
         } catch (error: unknown) {
+          // Issue #1261 — embed/insert-stage failure: model-scoped, as above.
           for (const entry of fallbackDocuments) {
             recordFailure(entry.relativePath, 'indexing', error);
             await recordQuarantineFailure(
@@ -2526,6 +2537,7 @@ export class FaissIndexManager {
               entry.relativePath,
               entry.fileHash,
               error,
+              { modelScoped: true },
             );
           }
           throw error;

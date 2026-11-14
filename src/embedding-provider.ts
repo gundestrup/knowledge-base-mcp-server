@@ -1,14 +1,13 @@
 // embedding-provider.ts — lazy construction for the active embeddings backend.
-// Issue #59 — provider modules are loaded lazily inside initialize(). Each
-// `@langchain/*` provider drags its full dep graph (e.g. @huggingface/inference,
-// openai, ollama) at import time; eager-loading all three for a process that
-// only ever uses one was ~170 ms / 81 MB peak RSS in RFC 007 §5.1.
+// Issue #59 — provider modules are loaded lazily inside initialize(). The
+// HuggingFace provider drags its full dep graph (@huggingface/inference) at
+// import time. Issue #1257 — Ollama and OpenAI-compatible providers use the
+// plain-fetch clients in embedding-http-client.ts, with no SDK import at all.
 // `import type` is erased by tsc, so the union type is preserved without any
 // runtime require/resolve of the unused provider's tree.
 import type { HuggingFaceInferenceEmbeddings } from '@langchain/community/embeddings/hf';
 import type { InferenceProviderOrPolicy } from '@huggingface/inference';
-import type { OllamaEmbeddings } from '@langchain/ollama';
-import type { OpenAIEmbeddings } from '@langchain/openai';
+import { OllamaFetchEmbeddings, OpenAIFetchEmbeddings, type EmbedCallOptions } from './embedding-http-client.js';
 import {
   HUGGINGFACE_ENDPOINT_URL,
   HUGGINGFACE_ENDPOINT_URL_OVERRIDDEN,
@@ -18,12 +17,14 @@ import {
   KB_FAKE_DIM,
   OLLAMA_BASE_URL,
   OPENAI_BASE_URL,
+  OPENAI_ORG_ID,
+  OPENAI_PROJECT_ID,
 } from './config/provider.js';
+import { resolveIndexingBatchSize } from './config/indexing.js';
 import { KBError } from './errors.js';
 import { logger } from './logger.js';
 import { instrumentEmbeddingsClient, type ProviderCallMetrics } from './metrics-recording.js';
 import type { EmbeddingProvider } from './model-id.js';
-import { makeOllamaOnFailedAttempt } from './ollama-error.js';
 import { providerBreakerRegistry, type ProviderBreakerRegistry } from './provider-breaker.js';
 
 /**
@@ -101,6 +102,16 @@ export function embeddingTaskPrefixesFor(
 }
 
 /**
+ * An embeddings client that may honour a per-call abort signal. The fetch
+ * clients do; the LangChain HuggingFace client takes no second argument and
+ * ignores it.
+ */
+interface SignalAwareEmbeddings {
+  embedDocuments(texts: string[], options?: EmbedCallOptions): Promise<number[][]>;
+  embedQuery(text: string, options?: EmbedCallOptions): Promise<number[]>;
+}
+
+/**
  * Issue #567 — wraps a provider client so every document/query embed call
  * carries its role prefix. Kept as a delegating wrapper (not a patch of the
  * inner client) so `instrumentEmbeddingsClient` can instrument it like any
@@ -108,19 +119,17 @@ export function embeddingTaskPrefixesFor(
  */
 export class TaskPrefixedEmbeddings {
   constructor(
-    private readonly inner: {
-      embedDocuments(texts: string[]): Promise<number[][]>;
-      embedQuery(text: string): Promise<number[]>;
-    },
+    private readonly inner: SignalAwareEmbeddings,
     readonly prefixes: EmbeddingTaskPrefixes,
   ) {}
 
-  async embedDocuments(texts: string[]): Promise<number[][]> {
-    return this.inner.embedDocuments(texts.map((text) => this.prefixes.document + text));
+  // Call options (the TimeoutEmbeddings abort signal, #1264) pass through.
+  async embedDocuments(texts: string[], options?: EmbedCallOptions): Promise<number[][]> {
+    return this.inner.embedDocuments(texts.map((text) => this.prefixes.document + text), options);
   }
 
-  async embedQuery(text: string): Promise<number[]> {
-    return this.inner.embedQuery(this.prefixes.query + text);
+  async embedQuery(text: string, options?: EmbedCallOptions): Promise<number[]> {
+    return this.inner.embedQuery(this.prefixes.query + text, options);
   }
 }
 
@@ -167,46 +176,40 @@ export class CircuitBrokenEmbeddings {
  * counts as a breaker failure — making the previously-dead `PROVIDER_TIMEOUT`
  * branch reachable on the embed path.
  *
- * Cancellation caveat: the LangChain embeddings interface
- * (`embedDocuments`/`embedQuery`) does not accept a per-call `AbortSignal`,
- * so on expiry we ABANDON the in-flight promise — the underlying fetch may
- * keep running to completion — rather than truly cancelling it. We still
- * create an `AbortController` and `abort()` it on the deadline so a
- * signal-aware inner client can observe the cancellation; today's providers
- * do not, which is the pragmatic fallback the issue calls out.
+ * Cancellation: each call gets its own `AbortController`, whose signal is
+ * passed to the inner client as `{ signal }`. On expiry the signal aborts, so
+ * the Ollama and OpenAI-compatible fetch clients cancel the in-flight request
+ * and stop retrying (#1264). The LangChain HuggingFace client ignores the
+ * signal; its abandoned call runs to completion in the background.
  */
 export class TimeoutEmbeddings {
   constructor(
-    private readonly inner: {
-      embedDocuments(texts: string[]): Promise<number[][]>;
-      embedQuery(text: string): Promise<number[]>;
-    },
+    private readonly inner: SignalAwareEmbeddings,
     readonly timeoutMs: number,
   ) {}
 
   async embedDocuments(texts: string[]): Promise<number[][]> {
-    return this.withDeadline('embedDocuments', () => this.inner.embedDocuments(texts));
+    return this.withDeadline('embedDocuments', (signal) => this.inner.embedDocuments(texts, { signal }));
   }
 
   async embedQuery(text: string): Promise<number[]> {
-    return this.withDeadline('embedQuery', () => this.inner.embedQuery(text));
+    return this.withDeadline('embedQuery', (signal) => this.inner.embedQuery(text, { signal }));
   }
 
-  private async withDeadline<T>(method: string, call: () => Promise<T>): Promise<T> {
+  private async withDeadline<T>(method: string, call: (signal: AbortSignal) => Promise<T>): Promise<T> {
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | null = null;
     const deadline = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
-        controller.abort();
-        reject(
-          new KBError(
-            'PROVIDER_TIMEOUT',
-            `embedding provider ${method} exceeded ${this.timeoutMs}ms deadline`,
-          ),
+        const timeout = new KBError(
+          'PROVIDER_TIMEOUT',
+          `embedding provider ${method} exceeded ${this.timeoutMs}ms deadline`,
         );
+        controller.abort(timeout);
+        reject(timeout);
       }, this.timeoutMs);
     });
-    const inFlight = call();
+    const inFlight = call(controller.signal);
     // If the deadline wins the race, `inFlight` is abandoned; swallow any late
     // rejection on that orphaned branch so it does not surface as an
     // unhandledRejection after we have already thrown PROVIDER_TIMEOUT.
@@ -221,8 +224,8 @@ export class TimeoutEmbeddings {
 
 export type EmbeddingsClient =
   | HuggingFaceInferenceEmbeddings
-  | OllamaEmbeddings
-  | OpenAIEmbeddings
+  | OllamaFetchEmbeddings
+  | OpenAIFetchEmbeddings
   | FakeEmbeddings
   | TaskPrefixedEmbeddings
   | TimeoutEmbeddings
@@ -332,16 +335,13 @@ async function constructEmbeddingsClient(
 
   if (provider === 'ollama') {
     logger.info(`Initializing FaissIndexManager with Ollama embeddings (model: ${modelName})`);
-    const { OllamaEmbeddings } = await import('@langchain/ollama');
-    // Issue #86 — Ollama's ResponseError uses snake_case `status_code`,
-    // which langchain's default failed-attempt handler doesn't recognise,
-    // so deterministic 400s (e.g. "input length exceeds the context length")
-    // burn 7 retries. We pass our own onFailedAttempt that short-circuits
-    // those errors and rethrows them as a translated KBError.
-    return new OllamaEmbeddings({
+    // Issue #1257 — plain-fetch client (no @langchain/ollama import). Issue
+    // #86's deterministic-400 translation (context-length overflow) lives in
+    // the client via ollama-error.ts, so it still fails fast with no retries.
+    return new OllamaFetchEmbeddings({
       baseUrl: OLLAMA_BASE_URL,
       model: modelName,
-      onFailedAttempt: makeOllamaOnFailedAttempt(modelName),
+      batchSize: resolveIndexingBatchSize('ollama'),
     });
   }
 
@@ -351,16 +351,18 @@ async function constructEmbeddingsClient(
     if (!openaiApiKey) {
       throw new KBError('PROVIDER_AUTH', 'OPENAI_API_KEY environment variable is required when using OpenAI provider');
     }
-    const { OpenAIEmbeddings } = await import('@langchain/openai');
-    // OPENAI_BASE_URL targets OpenAI-compatible endpoints (self-hosted
-    // gateways, Volcengine Ark, …). Passed explicitly so the endpoint does
-    // not depend on the transitive openai SDK's own env fallback —
-    // @langchain/openai itself never reads the variable. Unset,
-    // OPENAI_BASE_URL is the official api.openai.com default.
-    return new OpenAIEmbeddings({
-      apiKey: openaiApiKey,
+    // OPENAI_BASE_URL targets OpenAI-compatible endpoints (TEI, vLLM,
+    // self-hosted gateways, Volcengine Ark, ...). Unset, it is the official
+    // api.openai.com default. Issue #1257 — plain-fetch client.
+    const extraHeaders: Record<string, string> = {};
+    if (OPENAI_ORG_ID) extraHeaders['OpenAI-Organization'] = OPENAI_ORG_ID;
+    if (OPENAI_PROJECT_ID) extraHeaders['OpenAI-Project'] = OPENAI_PROJECT_ID;
+    return new OpenAIFetchEmbeddings({
+      baseUrl: OPENAI_BASE_URL,
       model: modelName,
-      configuration: { baseURL: OPENAI_BASE_URL },
+      apiKey: openaiApiKey,
+      extraHeaders,
+      batchSize: resolveIndexingBatchSize('openai'),
     });
   }
 

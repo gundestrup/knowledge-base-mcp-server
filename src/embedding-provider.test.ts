@@ -269,7 +269,7 @@ describe('embedding task prefixes (issue #567 — nomic-embed-text family)', () 
     const { CircuitBrokenEmbeddings, createEmbeddingsClient, TaskPrefixedEmbeddings } = await loadFresh({
       KB_EMBEDDING_TASK_PREFIXES: undefined,
     });
-    // Construction only — OllamaEmbeddings does not touch the network here.
+    // Construction only — OllamaFetchEmbeddings does not touch the network here.
     const client = await createEmbeddingsClient({ provider: 'ollama', modelName: 'nomic-embed-text' });
     expect(client).toBeInstanceOf(CircuitBrokenEmbeddings);
     // Issue #793 — the breaker now wraps a TimeoutEmbeddings deadline layer,
@@ -397,12 +397,12 @@ describe('embedding task prefixes (issue #567 — nomic-embed-text family)', () 
 });
 
 describe('OpenAI arm — OPENAI_BASE_URL for OpenAI-compatible endpoints', () => {
-  // OpenAIEmbeddings sits two wrappers down (breaker → timeout → provider).
+  // OpenAIFetchEmbeddings sits two wrappers down (breaker → timeout → provider).
   function unwrapToOpenAIEmbeddings(
     client: unknown,
-  ): { clientConfig: { baseURL?: string } } {
+  ): { baseUrl: string } {
     const timeout = (client as { inner: unknown }).inner;
-    return (timeout as { inner: { clientConfig: { baseURL?: string } } }).inner;
+    return (timeout as { inner: { baseUrl: string } }).inner;
   }
 
   it('derives the breaker key from OPENAI_BASE_URL so the key matches the endpoint actually called', async () => {
@@ -434,7 +434,7 @@ describe('OpenAI arm — OPENAI_BASE_URL for OpenAI-compatible endpoints', () =>
       provider: 'openai',
       modelName: 'text-embedding-3-small',
     });
-    expect(unwrapToOpenAIEmbeddings(client).clientConfig.baseURL)
+    expect(unwrapToOpenAIEmbeddings(client).baseUrl)
       .toBe('https://ark.cn-beijing.volces.com/api/v3');
   });
 
@@ -447,7 +447,7 @@ describe('OpenAI arm — OPENAI_BASE_URL for OpenAI-compatible endpoints', () =>
       provider: 'openai',
       modelName: 'text-embedding-3-small',
     });
-    expect(unwrapToOpenAIEmbeddings(client).clientConfig.baseURL)
+    expect(unwrapToOpenAIEmbeddings(client).baseUrl)
       .toBe('https://api.openai.com/v1');
   });
 
@@ -460,7 +460,7 @@ describe('OpenAI arm — OPENAI_BASE_URL for OpenAI-compatible endpoints', () =>
       provider: 'openai',
       modelName: 'text-embedding-3-small',
     });
-    expect(unwrapToOpenAIEmbeddings(client).clientConfig.baseURL)
+    expect(unwrapToOpenAIEmbeddings(client).baseUrl)
       .toBe('https://api.openai.com/v1');
   });
 });
@@ -545,6 +545,30 @@ describe('TimeoutEmbeddings (issue #793 — per-call embedding deadline)', () =>
       state: 'open',
       consecutive_failures: 1,
     })]);
+  });
+
+  it('aborts the fetch client on expiry so an abandoned call stops retrying (#1264)', async () => {
+    const { TimeoutEmbeddings, TaskPrefixedEmbeddings } = await loadFresh({});
+    const { OllamaFetchEmbeddings } = await import('./embedding-http-client.js');
+    const inputs: string[][] = [];
+    const fetchImpl = (async (_url: unknown, init?: RequestInit) => {
+      inputs.push((JSON.parse(String(init?.body)) as { input: string[] }).input);
+      return new Response('down', { status: 503 });
+    }) as unknown as typeof fetch;
+    const fetchClient = new OllamaFetchEmbeddings({
+      baseUrl: 'http://127.0.0.1:11434', model: 'nomic-embed-text', fetchImpl, maxRetries: 5,
+    });
+    // TaskPrefixedEmbeddings sits between the deadline and the client for nomic models.
+    const wrapped = new TimeoutEmbeddings(
+      new TaskPrefixedEmbeddings(fetchClient, { query: 'q: ', document: 'd: ' }),
+      50,
+    );
+
+    await expect(wrapped.embedDocuments(['x'])).rejects.toMatchObject({ code: 'PROVIDER_TIMEOUT' });
+    await expect(wrapped.embedQuery('y')).rejects.toMatchObject({ code: 'PROVIDER_TIMEOUT' });
+    // Without the abort, backoff retries at 250 ms and 750 ms would add calls.
+    await new Promise((r) => setTimeout(r, 800));
+    expect(inputs).toEqual([['d: x'], ['q: y']]);
   });
 
   it('createEmbeddingsClient wraps the network arm with a TimeoutEmbeddings inside the breaker', async () => {
