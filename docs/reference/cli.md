@@ -359,6 +359,7 @@ kb config — inspect and validate KB configuration
 Usage:
   kb config validate [--file=.env] [--format=md|json]
   kb config show [--format=md|json] [--non-default-only]
+  kb config client <name> [--format=md|json] [--command=npx|global]
 
 Validates known runtime configuration against the static KB config schema:
 type, enum membership, numeric ranges, URL syntax, and cross-variable
@@ -368,16 +369,27 @@ process.env. The command is read-only and does not probe live endpoints.
 Shows the effective value and source for every known configuration variable.
 Secrets such as API keys and MCP_AUTH_TOKEN are redacted.
 
+`client <name>` prints a ready-to-paste MCP server entry for one client,
+built from the same effective settings. API keys are never printed; they
+appear as placeholders such as <OPENAI_API_KEY> for you to fill in.
+  claude-desktop, cursor, windsurf, cline   "mcpServers" JSON block
+  vscode                                    "servers" JSON block, "type": "stdio"
+  claude-code                               a `claude mcp add …` command line
+
 Options:
   --file=<path>             Parse this dotenv file instead of runtime config.
   --format=md|json          Output format (default: md).
   --non-default-only        For show, print only env/file-supplied values.
+  --command=npx|global      For client, launch with npx -y <package>@latest
+                            (default) or with the absolute path of the
+                            knowledge-base-mcp-server bin found on PATH.
   --help, -h                Show this help.
 
 Exit codes:
   0   validation passed with no errors
   1   validation found one or more errors
-  2   invalid arguments or unreadable dotenv file
+  2   invalid arguments, unknown client, unreadable dotenv or project
+      config, or --command=global with the server bin not on PATH
 ```
 
 ## `kb diagnose`
@@ -1236,17 +1248,23 @@ kb quarantine — inspect and manage ingest quarantine entries
 
 Usage:
   kb quarantine list [--kb=<name>] [--reason=<reason>] [--format=md|json]
-  kb quarantine clear --kb=<name> --path=<relative-path>
-  kb quarantine clear --kb=<name> --all
-  kb quarantine retry --kb=<name> --path=<relative-path>
-  kb quarantine ack --kb=<name> --path=<relative-path>
+  kb quarantine clear --kb=<name> --path=<relative-path> [--model=<id>]
+  kb quarantine clear --kb=<name> --all [--model=<id>]
+  kb quarantine retry --kb=<name> --path=<relative-path> [--model=<id>]
+  kb quarantine ack --kb=<name> --path=<relative-path> [--model=<id>]
 
 Options:
   --kb=<name>           Knowledge base name. Required for mutating commands.
   --path=<rel>          KB-relative quarantined file path.
   --reason=<reason>     With list, show only entries matching a quarantine
                         reason such as secret_detected.
-  --all                 With clear, remove every entry in the KB.
+  --model=<id>          Narrow clear/retry/ack to one embedding model's
+                        entries. Provider failures are quarantined per model;
+                        without --model the command acts on every entry for
+                        the path (all models and KB-wide), and clear --all
+                        removes every entry in the KB.
+  --all                 With clear, remove every entry in the KB (or, with
+                        --model, every entry of that model).
   --format=md|json      Output format for list (default: md).
   --help, -h            Show this help.
 
@@ -2020,8 +2038,10 @@ Usage:
 Walks every `.md` / `.markdown` note under one or all KBs, parses YAML
 frontmatter, and reports each facet's distinct values with the number of
 notes carrying that value (sorted by count, then value). Use it to learn
-the valid vocabulary for `kb search --tags` / `--status` / `--type`
-filters before constructing a query. Strictly read-only.
+the valid vocabulary for `kb search --tag=<name>` filters before
+constructing a query. `kb search` filters on `tags` only; the `status`
+and `type` facets are reported for discovery and cannot be used as search
+filters. Strictly read-only.
 
 By default the taxonomy facets `tags`, `status`, and `type` are reported.
 `--facet=<name>` narrows the scan to a single frontmatter key (any key,

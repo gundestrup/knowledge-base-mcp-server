@@ -9,7 +9,7 @@ Point this server at a folder of markdown notes and it becomes searchable by mea
 
 You keep your notes as ordinary files on your own disk. The server reads them, splits them into chunks, turns each chunk into a vector with an embedding model of your choosing (a local Ollama model, OpenAI, or HuggingFace), and stores those vectors in a local [FAISS](https://faiss.ai/) index. Run it with a local embedding model and a local LLM and your notes never leave the machine; point it at a hosted provider and only then do they cross the network. Two front doors sit on top of that index:
 
-- **An MCP server** that any [Model Context Protocol](https://modelcontextprotocol.io) client — Claude Desktop, Codex CLI, Cursor, Continue, Cline — can call to search your notes, ask questions answered from them, and (optionally) write new ones.
+- **An MCP server** that any [Model Context Protocol](https://modelcontextprotocol.io) client — Claude Desktop, Claude Code, Codex CLI, Cursor, Continue, Cline, VS Code, Windsurf, JetBrains ([setup snippets](docs/clients.md)) — can call to search your notes, ask questions answered from them, and (optionally) write new ones.
 - **A `kb` command-line tool** for the same corpus from a terminal or an agent's shell, plus the operational commands the MCP surface doesn't expose: indexing, diagnostics, evaluation, and note curation.
 
 Throughout the docs, a *knowledge base* (or *shelf*) is one subdirectory of your notes root — `work/`, `research/`, `personal/` — that you can search individually or together.
@@ -101,9 +101,9 @@ npm run dev:setup
 
 `dev:setup` does three idempotent things:
 
-1. **`npm install` + `npm run build`** — a first build, so the bins exist before linking.
+1. **`npm ci` + `npm run build`** — installs exactly the committed lockfile (never rewrites `package-lock.json`; it replaces `node_modules/`), then a first build, so the bins exist before linking.
 2. **`npm link`** — symlinks `kb` and `knowledge-base-mcp-server` into the global node prefix (the path is printed during setup so you can verify where it landed). From then on, each `npm run build` overwrites `build/` in place and the global bins pick up the new code on the next invocation. **No re-link needed.**
-3. **`git config core.hooksPath .githooks`** — points git at the tracked [`.githooks/`](./.githooks) directory so the `post-merge` and `post-rewrite` hooks fire after every `git pull` (merge or rebase) and `git merge`. Each hook re-runs `npm install` if `package.json` changed and `npm run build` if any source changed, and stays quiet when nothing relevant moved. It runs **last** in the hook order, so a failed install or build leaves the repo in its original state.
+3. **`git config core.hooksPath .githooks`** — points git at the tracked [`.githooks/`](./.githooks) directory so the `post-merge` and `post-rewrite` hooks fire after every `git pull` (merge or rebase) and `git merge`. Each hook re-runs `npm ci` (which installs exactly the committed lockfile and never rewrites it) if `package.json` changed and `npm run build` if any source changed, and stays quiet when nothing relevant moved. It runs **last** in the hook order, so a failed install or build leaves the repo in its original state.
 
 The daily loop is then just `git pull` (the hook rebuilds) or `npm run build` after an edit; the global `kb` reflects the change on its next invocation.
 
@@ -560,7 +560,7 @@ The fetch is deliberately fenced in, because a URL is attacker-controlled input:
 
 ```bash
 kb tags --kb=work                       # list facet values (tags/status/type) with counts
-kb tags --facet=status --format=json    # discover the vocabulary for kb search --status filters
+kb tags --facet=tags --format=json      # discover the vocabulary for kb search --tag filters
 kb tag work/runbooks/deploy.md --add=verified        # dry run
 kb tag work/runbooks/deploy.md --add=verified --yes  # commit
 ```
@@ -665,6 +665,7 @@ See [`docs/operations/eval-gate-harness.md`](docs/operations/eval-gate-harness.m
 ```bash
 kb doctor                          # availability snapshot: index, embedding backend, LLM
 kb config validate                 # static env-var schema validation before startup
+kb config client claude-desktop    # ready-to-paste MCP client config from your settings
 kb serve                           # loopback daemon for warm reads; --warm pre-loads indexes
 kb serve status                    # daemon liveness and degraded-mode diagnostics
 kb reindex --with-context          # rebuild the index with contextual prefaces

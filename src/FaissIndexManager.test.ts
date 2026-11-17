@@ -176,20 +176,18 @@ jest.mock('@langchain/community/embeddings/hf', () => ({
   },
 }));
 
-jest.mock('@langchain/ollama', () => ({
+// Issue #1257 — ollama/openai embed through plain-fetch clients; mock that
+// module so construction is observable without any network.
+jest.mock('./embedding-http-client.js', () => ({
   __esModule: true,
-  OllamaEmbeddings: class MockOllamaEmbeddings {
+  OllamaFetchEmbeddings: class MockOllamaFetchEmbeddings {
     constructor(public _config: unknown) {
       ollamaEmbeddingConstructorMock(_config);
     }
     embedDocuments = mockEmbeddings.embedDocuments;
     embedQuery = mockEmbeddings.embedQuery;
   },
-}));
-
-jest.mock('@langchain/openai', () => ({
-  __esModule: true,
-  OpenAIEmbeddings: class MockOpenAIEmbeddings {
+  OpenAIFetchEmbeddings: class MockOpenAIFetchEmbeddings {
     constructor(public _config: unknown) {
       openAIEmbeddingConstructorMock(_config);
     }
@@ -282,16 +280,11 @@ describe('provider construction', () => {
     expect(ollamaEmbeddingConstructorMock).not.toHaveBeenCalled();
     await manager.initialize();
 
-    // Issue #86 — we now also pass an `onFailedAttempt` so deterministic
-    // Ollama 4xx errors (e.g. "input length exceeds the context length")
-    // short-circuit the AsyncCaller's 7-attempt retry loop.
-    expect(ollamaEmbeddingConstructorMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        baseUrl: 'http://127.0.0.1:11434',
-        model: 'mxbai-embed-large',
-        onFailedAttempt: expect.any(Function),
-      }),
-    );
+    expect(ollamaEmbeddingConstructorMock).toHaveBeenCalledWith({
+      baseUrl: 'http://127.0.0.1:11434',
+      model: 'mxbai-embed-large',
+      batchSize: 16,
+    });
   });
 
   it('throws when OPENAI_API_KEY is unset for the OpenAI provider', async () => {
@@ -338,7 +331,9 @@ describe('provider construction', () => {
     expect(openAIEmbeddingConstructorMock).toHaveBeenCalledWith({
       apiKey: 'test-openai-key',
       model: 'text-embedding-3-large',
-      configuration: { baseURL: 'https://api.openai.com/v1' },
+      baseUrl: 'https://api.openai.com/v1',
+      extraHeaders: {},
+      batchSize: 64,
     });
   });
 
@@ -2191,6 +2186,128 @@ describe('FaissIndexManager permission handling', () => {
     await manager.updateIndex('default');
     expect(fromTextsMock).toHaveBeenCalledTimes(1);
     await expect(listIngestQuarantine(defaultKb)).resolves.toEqual([]);
+  });
+
+  it('scopes provider-failure quarantine to the failing model and clears it on model removal (#1258)', async () => {
+    const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'kb-faiss-quarantine-model-'));
+    const kbDir = path.join(tempDir, 'kb');
+    const defaultKb = path.join(kbDir, 'default');
+    await fsp.mkdir(defaultKb, { recursive: true });
+    const docPath = path.join(defaultKb, 'note.md');
+    await fsp.writeFile(docPath, '# Note\n\nFirst version of the note.');
+
+    process.env.KNOWLEDGE_BASES_ROOT_DIR = kbDir;
+    process.env.FAISS_INDEX_PATH = path.join(tempDir, '.faiss');
+    process.env.EMBEDDING_PROVIDER = 'huggingface';
+    process.env.HUGGINGFACE_API_KEY = 'test-key';
+
+    jest.resetModules();
+    const { FaissIndexManager } = await import('./FaissIndexManager.js');
+    const { KBError } = await import('./errors.js');
+    const { listIngestQuarantine, removeIngestQuarantineForModel } = await import('./ingest-quarantine.js');
+    const managerA = new FaissIndexManager();
+    const managerB = new FaissIndexManager({ provider: 'ollama', modelName: 'mxbai-embed-large' });
+    await managerA.initialize();
+    await managerB.initialize();
+    expect(managerA.modelId).not.toBe(managerB.modelId);
+
+    // B's provider times out on every file.
+    embedDocumentsMock.mockRejectedValue(new KBError('PROVIDER_TIMEOUT', 'embedding timed out'));
+    await expect(managerB.updateIndex('default')).rejects.toThrow(/timed out/);
+    const records = await listIngestQuarantine(defaultKb);
+    expect(records).toEqual([
+      expect.objectContaining({
+        relative_path: 'note.md',
+        model_id: managerB.modelId,
+        error_category: 'provider',
+        error_code: 'PROVIDER_TIMEOUT',
+      }),
+    ]);
+
+    // A is unaffected: its provider is healthy, so it indexes the file.
+    embedDocumentsMock.mockReset();
+    embedDocumentsMock.mockImplementation(async (texts: string[]) => texts.map(mockVectorForText));
+    await managerA.updateIndex('default');
+    expect(managerA.getLastIndexUpdateSummary()).toMatchObject({
+      status: 'success',
+      files_changed: 1,
+      files_skipped: 0,
+    });
+    expect(addVectorsMock).toHaveBeenCalled();
+    // A's success must not clear B's record.
+    expect(await listIngestQuarantine(defaultKb)).toHaveLength(1);
+
+    // A changed file is still indexed by A (the repro's unconfirmed step).
+    addVectorsMock.mockClear();
+    await fsp.writeFile(docPath, '# Note\n\nSecond version of the note, changed.');
+    await managerA.updateIndex('default');
+    expect(addVectorsMock).toHaveBeenCalled();
+    expect(managerA.getLastIndexUpdateSummary()).toMatchObject({ files_changed: 1, files_skipped: 0 });
+    // A never touches B's record; it is dropped when B next sees the changed content.
+    expect(await listIngestQuarantine(defaultKb)).toEqual([
+      expect.objectContaining({ model_id: managerB.modelId }),
+    ]);
+
+    // Removing a model clears exactly its records.
+    embedDocumentsMock.mockRejectedValue(new KBError('PROVIDER_TIMEOUT', 'embedding timed out'));
+    await fsp.writeFile(docPath, '# Note\n\nThird version.');
+    await expect(managerB.updateIndex('default')).rejects.toThrow(/timed out/);
+    expect(await listIngestQuarantine(defaultKb)).toHaveLength(1);
+    await expect(removeIngestQuarantineForModel(defaultKb, managerA.modelId)).resolves.toBe(0);
+    await expect(removeIngestQuarantineForModel(defaultKb, managerB.modelId)).resolves.toBe(1);
+    await expect(listIngestQuarantine(defaultKb)).resolves.toEqual([]);
+  });
+
+  it.each([
+    ['a VALIDATION KBError (413 batch too large)', 'validation'],
+    ['a raw SDK error (HuggingFace connection refused)', 'raw'],
+  ] as const)('scopes an embed-call failure to the failing model whatever its category: %s (#1261)', async (_label, kind) => {
+    const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'kb-faiss-quarantine-embed-'));
+    const kbDir = path.join(tempDir, 'kb');
+    const defaultKb = path.join(kbDir, 'default');
+    await fsp.mkdir(defaultKb, { recursive: true });
+    await fsp.writeFile(path.join(defaultKb, 'note.md'), '# Note\n\nA note both models index.');
+
+    process.env.KNOWLEDGE_BASES_ROOT_DIR = kbDir;
+    process.env.FAISS_INDEX_PATH = path.join(tempDir, '.faiss');
+    process.env.EMBEDDING_PROVIDER = 'huggingface';
+    process.env.HUGGINGFACE_API_KEY = 'test-key';
+
+    jest.resetModules();
+    const { FaissIndexManager } = await import('./FaissIndexManager.js');
+    const { KBError } = await import('./errors.js');
+    const { listIngestQuarantine, shouldRetryIngest } = await import('./ingest-quarantine.js');
+    const managerA = new FaissIndexManager();
+    const managerB = new FaissIndexManager({ provider: 'ollama', modelName: 'mxbai-embed-large' });
+    await managerA.initialize();
+    await managerB.initialize();
+
+    const failure = kind === 'validation'
+      ? new KBError('VALIDATION', 'OpenAI-compatible embedding request rejected (413): batch too large')
+      : new Error('Connection error.');
+    embedDocumentsMock.mockRejectedValue(failure);
+    await expect(managerB.updateIndex('default')).rejects.toThrow(failure.message);
+    expect(await listIngestQuarantine(defaultKb)).toEqual([
+      expect.objectContaining({
+        relative_path: 'note.md',
+        model_id: managerB.modelId,
+        error_category: kind === 'validation' ? 'input' : 'unknown',
+      }),
+    ]);
+    await expect(shouldRetryIngest(defaultKb, 'note.md', { modelId: managerA.modelId }))
+      .resolves.toMatchObject({ retry: true, reason: 'no_record' });
+
+    // A's provider is healthy, so A still indexes the file.
+    embedDocumentsMock.mockReset();
+    embedDocumentsMock.mockImplementation(async (texts: string[]) => texts.map(mockVectorForText));
+    addVectorsMock.mockClear();
+    await managerA.updateIndex('default');
+    expect(addVectorsMock).toHaveBeenCalled();
+    expect(managerA.getLastIndexUpdateSummary()).toMatchObject({
+      status: 'success',
+      files_changed: 1,
+      files_skipped: 0,
+    });
   });
 
   it('quarantines secret-bearing chunks before embedding when ingest secret scan is enabled', async () => {

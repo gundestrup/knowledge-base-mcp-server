@@ -14,8 +14,10 @@ rollback commands over design background.
 | [Index quantization](index-quantization.md) | Registering or evaluating an SQ8 FAISS index. |
 | [Local services](local-services.md) | Checking Ollama, llama-server, n8n, and local service health. |
 | [Logs reader](logs-reader.md) | Inspecting canonical logs and request ids. |
+| [MCP Registry listing](mcp-registry.md) | Publishing the server listing on the MCP Registry after an npm release. |
 | [Metrics export](metrics-export.md) | Enabling and scraping OpenMetrics output. |
 | [Query cache](query-cache.md) | Interpreting query-embedding cache telemetry, tuning disk budget, or clearing cache entries. |
 | [Research workflow](research-workflow.md) | Running the read-only `kb research` evidence pass. |
 | [Secret scan](secret-scan.md) | Enabling ingest-time credential scanning and reviewing quarantine hits. |
 | [Switching embedding models](switching-embedding-models.md) | Changing the active embedding model with verification and rollback. |
+| [TEI embedding server](tei-embedding-server.md) | Running Text Embeddings Inference as a small-VRAM, fast bulk-indexing embedding server. |
