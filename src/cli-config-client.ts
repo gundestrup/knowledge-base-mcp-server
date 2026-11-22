@@ -385,7 +385,7 @@ export function findOnPath(
 ): string | null {
   const candidates = platform === 'win32' ? [`${name}.cmd`, `${name}.exe`, name] : [name];
   for (const dir of (envPath ?? '').split(path.delimiter)) {
-    if (dir === '' || /[\\/]_npx[\\/]|[\\/]node_modules[\\/]\.bin[\\/]?$/.test(dir)) continue;
+    if (dir === '' || /(?:[\\/]_npx[\\/]|[\\/]node_modules[\\/]\.bin[\\/]?$)/.test(dir)) continue;
     for (const candidate of candidates) {
       const full = path.resolve(dir, candidate);
       try {
