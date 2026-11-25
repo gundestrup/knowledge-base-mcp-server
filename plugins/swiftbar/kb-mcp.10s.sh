@@ -28,6 +28,7 @@ HEALTH="http://${BIND}:${PORT}/health" # NOSONAR
 REPO="${KB_MCP_REPO:-$HOME/workspace/knowledge-base-mcp-server}"
 HELPER="$REPO/plugins/swiftbar/kb-mcp-rebuild.sh"
 STATUS_HELPER="$REPO/plugins/swiftbar/kb-mcp-reindex-status.sh"
+BACKFILL_HELPER="$REPO/plugins/swiftbar/kb-mcp-backfill.sh"
 UNINSTALL="$REPO/plugins/swiftbar/kb-mcp-uninstall.sh"
 UPDATER="$REPO/plugins/swiftbar/update.sh"
 
@@ -119,6 +120,17 @@ if [[ $BUSY -eq 0 && -d $INDEX_DIR ]]; then
   done
 fi
 
+# Contextual-preface backlog from the durable status ledger
+# ($INDEX_DIR/.reindex.progress.json, written by `kb reindex status` and
+# every `kb reindex` run). totals.files_pending is the last "files_pending"
+# key in the document — per-KB objects precede the totals block.
+CTX_PENDING=""
+progress_json="$INDEX_DIR/.reindex.progress.json"
+if [[ -f $progress_json ]]; then
+  _p="$(grep -oE '"files_pending": *[0-9]+' "$progress_json" 2>/dev/null | tail -1 | grep -oE '[0-9]+')"
+  [[ -n ${_p:-} && $_p -gt 0 ]] && CTX_PENDING=" — ${_p} pending"
+fi
+
 if [[ "$state" == "running" && "$health" == *'"ok"'* ]]; then
   if [[ $BUSY -eq 1 ]]; then
     echo "KB ◐ | color=#f9a825"
@@ -146,6 +158,9 @@ else
   # copied over itself, which fetches the full set (test.sh pins that), but if
   # the helper is still missing, re-running the installed update.sh repairs it.
   echo "Reindex status… (helper missing — repair) | bash=$UPDATER terminal=true refresh=true"
+fi
+if [[ -f $BACKFILL_HELPER ]]; then
+  echo "Context backfill${CTX_PENDING} | bash=$BACKFILL_HELPER terminal=true refresh=true"
 fi
 echo "Restart | bash=/bin/launchctl param1=kickstart param2=-k param3=$DOMAIN terminal=false refresh=true"
 echo "Stop | bash=/bin/launchctl param1=bootout param2=$DOMAIN terminal=false refresh=true"
