@@ -8,6 +8,9 @@ trigger-watcher refresh was running.
 Status: **analysis only — no code changed.** Proposals below are
 candidates for RFCs, not commitments.
 
+Updated 2026-11-25 after upstream landed issue #1228 — see
+"Status after upstream #1235" below.
+
 ## The incident
 
 - `.reindex-trigger` in the KB was touched at 23:51; a trigger-watcher
@@ -64,6 +67,54 @@ candidates for RFCs, not commitments.
   system whose storage is already eventually consistent. The manual
   bypass proved the safe path: write file + hash sidecar, let the
   next refresh's walk embed it.
+
+## Status after upstream #1235
+
+Upstream implemented issue #1228 in PR #1235
+(`KB_RETRIEVE_REFRESH_MODE` = `sync` | `async` | `off`), merged
+2026-11-12 and since pulled into this fork. It fixes the **read
+path**, which was #1228's scope: in `async` mode
+`retrieve_knowledge` serves from the committed index snapshot via a
+cached read-only manager and never joins the write lock; the
+refresh is backgrounded through `BackgroundRefreshCoordinator`
+(`src/retrieve-refresh.ts`), a single-flight runner keyed by model
+dir. Responses carry `index_status` (`refresh_mode`, `state`,
+`served_from`) — shipped without ETA/`pending_files`, which
+upstream deliberately left out of the contract.
+
+### What it does not fix — the mutation path analyzed here
+
+- `add_document`/`delete_document` still couple write + embed in
+  one `withWriteLock` with all-or-nothing rollback. Any writer
+  holding the lock still rejects mutations with
+  `REFRESH_LOCK_BUSY` after the ~2 s budget — the incident's exact
+  failure mode stands.
+- `sync` remains the default, so reads still join the lock unless
+  deployments opt in. Set `KB_RETRIEVE_REFRESH_MODE=async` — it
+  removes the entire class of read-path lock contenders, leaving
+  mutations to contend only with real writers. Upstream invited
+  dogfooding before considering `async` the default.
+
+### What it changes for the TODO below
+
+- **Item 1's "enqueue the embed" option now has a substrate.**
+  `BackgroundRefreshCoordinator.trigger(modelDir, run)` is the
+  shared single-flight queue; a decoupled accept path can write the
+  file + sidecar, return `index_status: 'refreshing'`, and let the
+  coordinator run the embed under its own lock acquisition.
+- **`index_status` is now response-contract precedent.** A
+  mutation tool returning `{ indexed: false, index_status }` for an
+  accepted-pending write matches an established shape — no new
+  contract surface needed.
+- **Semantic content hash stays open.** The `kbm.*` frontmatter
+  amplifier from #1228 was explicitly deferred upstream: redefining
+  the hash forces a one-time full re-embed and needs a frontmatter
+  whitelist design. Worth its own RFC — directly relevant to
+  workflows where a curation tool stamps frontmatter.
+- **ETA/`pending_files` in `index_status` was declined for now** —
+  upstream will revisit if a caller would act on it. Our
+  `reindex_status` tool idea (item 3) covers the same need without
+  coupling the retrieve contract to indexer internals.
 
 ## TODO
 
