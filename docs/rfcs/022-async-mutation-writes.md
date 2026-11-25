@@ -7,7 +7,7 @@
 `src/retrieve-refresh.ts`, `src/reindex-runner.ts`
 **Tracks:** eliminating `REFRESH_LOCK_BUSY` as a user-visible failure mode
 on the mutation path
-**Prior art / analysis:** `README.todo.async.md` (incident postmortem,
+**Prior art / analysis:** `docs/todo-async-writes.md` (incident postmortem,
 2026-11-17)
 
 ## Problem
