@@ -18,6 +18,7 @@ export const SUPPORTED_CLIENTS = [
   'cline',
   'vscode',
   'claude-code',
+  'codex',
 ] as const;
 
 export type ClientName = (typeof SUPPORTED_CLIENTS)[number];
@@ -26,16 +27,19 @@ export const SERVER_NAME = 'knowledge-base';
 export const PACKAGE_SPEC = '@jeanibarz/knowledge-base-mcp-server@latest';
 export const SERVER_BIN = 'knowledge-base-mcp-server';
 
+/** Clients with a documented one-click install link (`--format=link`). */
+export const LINK_CLIENTS = ['cursor', 'vscode'] as const satisfies readonly ClientName[];
+
 export interface ConfigClientArgs {
   client: ClientName;
-  format: 'md' | 'json';
+  format: 'md' | 'json' | 'link';
   command: 'npx' | 'global';
 }
 
 export interface ConfigClientReport {
   schema_version: 'kb.config-client.v1';
   client: ClientName;
-  shape: 'mcpServers' | 'servers' | 'shell';
+  shape: 'mcpServers' | 'servers' | 'shell' | 'toml';
   command_mode: 'npx' | 'global';
   config_file: string | null;
   active_model: string | null;
@@ -85,6 +89,13 @@ const CLIENTS: Record<ClientName, ClientInfo> = {
   'claude-code': {
     shape: 'shell',
     locations: ['Run the command in a shell; -s user makes the server available in every project'],
+  },
+  codex: {
+    shape: 'toml',
+    locations: [
+      'macOS / Linux: ~/.codex/config.toml ($CODEX_HOME/config.toml when CODEX_HOME is set)',
+      'Windows: %USERPROFILE%\\.codex\\config.toml',
+    ],
   },
 };
 
@@ -192,6 +203,21 @@ export async function runConfigClient(
   }
 
   const out = buildClientReport(parsed, launch, env, projectConfig.path, active?.id ?? null);
+  if (parsed.format === 'link') {
+    const server = linkServerEntry(out);
+    const links = out.client === 'cursor'
+      ? [cursorInstallLink(server)]
+      : [vscodeInstallUrl(server), vscodeRedirectLink(vscodeInstallUrl(server))];
+    process.stdout.write(`${links.join('\n')}\n`);
+    if (out.placeholders.length > 0) {
+      process.stderr.write(
+        `kb config client: left out of the link: ${out.placeholders.join(', ')}. `
+        + 'A link must never carry a secret; after installing, add '
+        + `${out.placeholders.length === 1 ? 'it' : 'them'} to the server's env in the client.\n`,
+      );
+    }
+    return 0;
+  }
   if (parsed.format === 'json') {
     process.stdout.write(`${JSON.stringify(out, null, 2)}\n`);
   } else {
@@ -205,8 +231,8 @@ export function parseConfigClientArgs(rest: readonly string[]): ConfigClientArgs
   let format: ConfigClientArgs['format'] = 'md';
   let command: ConfigClientArgs['command'] = 'npx';
   for (const raw of rest) {
-    if (raw === '--format=json' || raw === '--format=md') {
-      format = raw === '--format=json' ? 'json' : 'md';
+    if (raw === '--format=json' || raw === '--format=md' || raw === '--format=link') {
+      format = raw.slice('--format='.length) as ConfigClientArgs['format'];
       continue;
     }
     if (raw.startsWith('--format=')) throw new Error(`invalid --format: ${raw}`);
@@ -223,6 +249,11 @@ export function parseConfigClientArgs(rest: readonly string[]): ConfigClientArgs
   if (client === undefined) throw new Error(`expected a client name; ${supported}`);
   if (!(SUPPORTED_CLIENTS as readonly string[]).includes(client)) {
     throw new Error(`unknown client: ${client}; ${supported}`);
+  }
+  if (format === 'link' && !(LINK_CLIENTS as readonly string[]).includes(client)) {
+    throw new Error(
+      `--format=link is not available for ${client}; supported clients: ${LINK_CLIENTS.join(', ')}`,
+    );
   }
   return { client: client as ClientName, format, command };
 }
@@ -319,6 +350,18 @@ function renderSnippet(
     parts.push(['--', launch.command, ...launch.args].map(shellQuote).join(' '));
     return parts.join(' \\\n  ');
   }
+  if (shape === 'toml') {
+    const table = `mcp_servers.${tomlKey(SERVER_NAME)}`;
+    const lines = [
+      `[${table}]`,
+      `command = ${tomlString(launch.command)}`,
+      `args = [${launch.args.map(tomlString).join(', ')}]`,
+      '',
+      `[${table}.env]`,
+      ...Object.entries(env).map(([name, value]) => `${tomlKey(name)} = ${tomlString(value)}`),
+    ];
+    return lines.join('\n');
+  }
   const server = {
     ...(shape === 'servers' ? { type: 'stdio' } : {}),
     command: launch.command,
@@ -328,6 +371,96 @@ function renderSnippet(
   return JSON.stringify({ [shape]: { [SERVER_NAME]: server } }, null, 2);
 }
 
+/** The server entry an install link carries: launch command plus env. */
+export interface LinkServerEntry {
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+}
+
+/**
+ * The report's server entry without its placeholder variables. An installed
+ * `<OPENAI_API_KEY>` value would only fail, and a real key must never travel
+ * in a URL, so the user adds those variables in the client after installing.
+ */
+export function linkServerEntry(report: ConfigClientReport): LinkServerEntry {
+  const omitted = new Set(report.placeholders);
+  const env = Object.fromEntries(Object.entries(report.env).filter(([name]) => !omitted.has(name)));
+  return { command: report.command, args: report.args, env };
+}
+
+/**
+ * Cursor MCP install deeplink. Format from
+ * https://cursor.com/docs/context/mcp/install-links:
+ * `cursor://anysphere.cursor-deeplink/mcp/install?name=$NAME&config=$BASE64_ENCODED_CONFIG`,
+ * where `config` is base64 of the JSON-stringified server object (the name
+ * goes in `name` only). Standard base64 can contain `+`, `/` and `=`, so both
+ * values are percent-encoded; a URL parser then returns the exact base64.
+ */
+export function cursorInstallLink(server: LinkServerEntry, name: string = SERVER_NAME): string {
+  const config = Buffer.from(JSON.stringify(server), 'utf8').toString('base64');
+  return `cursor://anysphere.cursor-deeplink/mcp/install?name=${encodeURIComponent(name)}`
+    + `&config=${encodeURIComponent(config)}`;
+}
+
+/**
+ * VS Code MCP install URL. Format from
+ * https://code.visualstudio.com/api/extension-guides/ai/mcp:
+ * `vscode:mcp/install?${encodeURIComponent(JSON.stringify(obj))}` with
+ * `obj = {"name": …, "command": …, "args": […], "env": {…}}`.
+ */
+export function vscodeInstallUrl(server: LinkServerEntry, name: string = SERVER_NAME): string {
+  return `vscode:mcp/install?${encodeURIComponent(JSON.stringify({ name, ...server }))}`;
+}
+
+/**
+ * The clickable https form of a `vscode:` URL, for web pages and READMEs
+ * (GitHub renders only http(s) links). Same vendor page as vscodeInstallUrl:
+ * `https://vscode.dev/redirect?url=<url-encoded vscode: URL>`.
+ */
+export function vscodeRedirectLink(vscodeUrl: string): string {
+  return `https://vscode.dev/redirect?url=${encodeURIComponent(vscodeUrl)}`;
+}
+
+/**
+ * The server entry behind the README "Install in VS Code" button and the
+ * Cursor link in docs/clients.md: the zero-secret Ollama setup. No
+ * KNOWLEDGE_BASES_ROOT_DIR, because a link cannot expand $HOME; the server's
+ * default root applies. A test rebuilds both links from this entry.
+ */
+export const DOCS_LINK_SERVER: LinkServerEntry = {
+  command: 'npx',
+  args: ['-y', PACKAGE_SPEC],
+  env: { EMBEDDING_PROVIDER: 'ollama' },
+};
+
+/**
+ * A TOML basic string (`"..."`). TOML requires escaping the quote, the
+ * backslash and every control character except tab (U+0000-U+001F, U+007F);
+ * Windows paths are full of backslashes, so this is not optional.
+ */
+export function tomlString(value: string): string {
+  let out = '"';
+  for (const char of value) {
+    const code = char.codePointAt(0) ?? 0;
+    if (char === '"') out += '\\"';
+    else if (char === '\\') out += '\\\\';
+    else if (char === '\n') out += '\\n';
+    else if (char === '\r') out += '\\r';
+    else if (char === '\t') out += '\\t';
+    else if (char === '\b') out += '\\b';
+    else if (char === '\f') out += '\\f';
+    else if (code < 0x20 || code === 0x7f) out += `\\u${code.toString(16).toUpperCase().padStart(4, '0')}`;
+    else out += char;
+  }
+  return `${out}"`;
+}
+
+/** A TOML key: bare when it only uses A-Z a-z 0-9 _ -, quoted otherwise. */
+export function tomlKey(key: string): string {
+  return /^[A-Za-z0-9_-]+$/.test(key) ? key : tomlString(key);
+}
+
 /** POSIX single-quote a word unless it is made only of shell-safe characters. */
 export function shellQuote(value: string): string {
   if (/^[A-Za-z0-9_@%+=:,./-]+$/.test(value)) return value;
@@ -335,7 +468,7 @@ export function shellQuote(value: string): string {
 }
 
 export function formatConfigClientMarkdown(report: ConfigClientReport): string {
-  const lang = report.shape === 'shell' ? 'bash' : 'json';
+  const lang = report.shape === 'shell' ? 'bash' : report.shape === 'toml' ? 'toml' : 'json';
   const lines = [
     `# kb config client ${report.client}`,
     '',
@@ -352,7 +485,9 @@ export function formatConfigClientMarkdown(report: ConfigClientReport): string {
   if (report.placeholders.length > 0) {
     lines.push('', `Replace these placeholders before use: ${report.placeholders.map((n) => `<${n}>`).join(', ')}`);
   }
-  if (report.shape !== 'shell') {
+  if (report.shape === 'toml') {
+    lines.push('', 'Codex CLI rereads config.toml each time it starts, so no restart is needed.');
+  } else if (report.shape !== 'shell') {
     lines.push('', 'Restart the client after editing its config file.');
   }
   return `${lines.join('\n')}\n`;

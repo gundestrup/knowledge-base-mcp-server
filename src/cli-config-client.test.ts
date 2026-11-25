@@ -5,12 +5,18 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 import {
+  cursorInstallLink,
+  DOCS_LINK_SERVER,
   findOnPath,
+  LINK_CLIENTS,
   parseConfigClientArgs,
   runConfigClient,
   shellQuote,
   SUPPORTED_CLIENTS,
+  tomlString,
   type ConfigClientReport,
+  vscodeInstallUrl,
+  vscodeRedirectLink,
 } from './cli-config-client.js';
 import { resetProjectConfigForTests } from './config/project-config.js';
 import { deriveModelId } from './model-id.js';
@@ -30,7 +36,7 @@ const SECRETS = {
   KB_OPENROUTER_API_KEY: fakeSecret('openrouter'),
 };
 
-const JSON_CLIENTS = SUPPORTED_CLIENTS.filter((c) => c !== 'claude-code');
+const JSON_CLIENTS = SUPPORTED_CLIENTS.filter((c) => c !== 'claude-code' && c !== 'codex');
 
 let stdout = '';
 let stderr = '';
@@ -83,7 +89,7 @@ async function runJson(...args: string[]): Promise<ConfigClientReport> {
 }
 
 function fencedBlock(markdown: string): string {
-  const m = /```(?:json|bash)\n([\s\S]*?)\n```/.exec(markdown);
+  const m = /```(?:json|bash|toml)\n([\s\S]*?)\n```/.exec(markdown);
   if (m === null) throw new Error(`no fenced block in:\n${markdown}`);
   return m[1];
 }
@@ -93,6 +99,117 @@ function claudeArgv(command: string): string[] {
   const r = spawnSync('bash', ['-c', `claude() { printf '%s\\0' "$@"; }\n${command}`], { encoding: 'utf-8' });
   expect(r.status).toBe(0);
   return r.stdout.split('\0').slice(0, -1);
+}
+
+type TomlTable = { [key: string]: string | string[] | TomlTable };
+
+/**
+ * Strict parser for the TOML subset `kb config client codex` emits: `[a.b]`
+ * table headers, and `key = "basic string"` or `key = ["...", ...]` pairs.
+ * It decodes escapes per the TOML 1.0 spec independently of tomlString and
+ * throws on anything a real TOML parser would reject in that subset (raw
+ * control characters, unknown escapes, unterminated strings, trailing junk,
+ * duplicate keys), so the encoder cannot pass by sharing a bug with it.
+ */
+function parseToml(text: string): TomlTable {
+  const root: TomlTable = {};
+  let table = root;
+  const fail = (line: number, why: string): never => {
+    throw new Error(`TOML line ${line + 1}: ${why}`);
+  };
+  const BARE = /^[A-Za-z0-9_-]+/;
+  text.split('\n').forEach((raw, lineNo) => {
+    let i = 0;
+    const ws = (): void => { while (raw[i] === ' ' || raw[i] === '\t') i++; };
+    const end = (): void => {
+      ws();
+      if (i < raw.length && raw[i] !== '#') fail(lineNo, `unexpected ${JSON.stringify(raw.slice(i))}`);
+    };
+    const basicString = (): string => {
+      if (raw[i] !== '"') fail(lineNo, 'expected "');
+      i++;
+      let out = '';
+      for (;;) {
+        if (i >= raw.length) fail(lineNo, 'unterminated string');
+        const ch = raw[i];
+        const code = ch.charCodeAt(0);
+        if (ch === '"') { i++; return out; }
+        if ((code < 0x20 && ch !== '\t') || code === 0x7f) fail(lineNo, `raw control U+${code.toString(16)}`);
+        if (ch !== '\\') { out += ch; i++; continue; }
+        const esc = raw[i + 1];
+        const simple: Record<string, string> = { b: '\b', t: '\t', n: '\n', f: '\f', r: '\r', '"': '"', '\\': '\\' };
+        if (esc in simple) { out += simple[esc]; i += 2; continue; }
+        if (esc === 'u' || esc === 'U') {
+          const len = esc === 'u' ? 4 : 8;
+          const hex = raw.slice(i + 2, i + 2 + len);
+          if (!new RegExp(`^[0-9A-Fa-f]{${len}}$`).test(hex)) fail(lineNo, `bad \\${esc} escape`);
+          out += String.fromCodePoint(parseInt(hex, 16));
+          i += 2 + len;
+          continue;
+        }
+        fail(lineNo, `invalid escape \\${esc}`);
+      }
+    };
+    const key = (): string => {
+      if (raw[i] === '"') return basicString();
+      const m = BARE.exec(raw.slice(i));
+      if (m === null) fail(lineNo, 'expected a key');
+      i += m![0].length;
+      return m![0];
+    };
+    ws();
+    if (i >= raw.length || raw[i] === '#') return;
+    if (raw[i] === '[') {
+      i++;
+      table = root;
+      for (;;) {
+        ws();
+        const k = key();
+        ws();
+        const next = table[k] ?? {};
+        if (typeof next !== 'object' || Array.isArray(next)) fail(lineNo, `${k} is not a table`);
+        table[k] = next;
+        table = next as TomlTable;
+        if (raw[i] === '.') { i++; continue; }
+        if (raw[i] === ']') { i++; break; }
+        fail(lineNo, 'bad table header');
+      }
+      end();
+      return;
+    }
+    const k = key();
+    ws();
+    if (raw[i] !== '=') fail(lineNo, 'expected =');
+    i++;
+    ws();
+    if (k in table) fail(lineNo, `duplicate key ${k}`);
+    if (raw[i] === '[') {
+      i++;
+      const items: string[] = [];
+      ws();
+      while (raw[i] !== ']') {
+        items.push(basicString());
+        ws();
+        if (raw[i] === ',') { i++; ws(); } else if (raw[i] !== ']') fail(lineNo, 'expected , or ]');
+      }
+      i++;
+      table[k] = items;
+    } else {
+      table[k] = basicString();
+    }
+    end();
+  });
+  return root;
+}
+
+function codexServer(toml: string): { command: string; args: string[]; env: Record<string, string> } {
+  const parsed = parseToml(toml);
+  expect(Object.keys(parsed)).toEqual(['mcp_servers']);
+  const servers = parsed.mcp_servers as TomlTable;
+  expect(Object.keys(servers)).toEqual(['knowledge-base']);
+  const server = servers['knowledge-base'] as TomlTable;
+  expect(Object.keys(server).sort()).toEqual(['args', 'command', 'env']);
+  return server as unknown as { command: string; args: string[]; env: Record<string, string> };
 }
 
 function envFromClaudeArgv(argv: string[]): Record<string, string> {
@@ -182,6 +299,79 @@ describe('kb config client: each supported client', () => {
     const report = await runJson('claude-code');
     expect(report.shape).toBe('shell');
     expect(envFromClaudeArgv(claudeArgv(report.snippet))).toEqual(report.env);
+  });
+});
+
+describe('kb config client codex (TOML)', () => {
+  beforeEach(() => {
+    process.env.EMBEDDING_PROVIDER = 'openai';
+    process.env.OPENAI_MODEL_NAME = 'text-embedding-3-large';
+  });
+
+  it('markdown block is a TOML table with the effective settings', async () => {
+    expect(await run(['codex'])).toBe(0);
+    expect(stdout).toContain('```toml\n[mcp_servers.knowledge-base]\n');
+    expect(stdout).toContain('~/.codex/config.toml');
+    expect(stdout).toContain('Replace these placeholders before use: <OPENAI_API_KEY>');
+    expect(stdout).toContain('no restart is needed');
+    expect(stdout).not.toContain('Restart the client');
+    const server = codexServer(fencedBlock(stdout));
+    expect(server.command).toBe('npx');
+    expect(server.args).toEqual(['-y', '@jeanibarz/knowledge-base-mcp-server@latest']);
+    expect(server.env).toEqual({
+      KNOWLEDGE_BASES_ROOT_DIR: kbRoot,
+      EMBEDDING_PROVIDER: 'openai',
+      OPENAI_API_KEY: '<OPENAI_API_KEY>',
+      OPENAI_MODEL_NAME: 'text-embedding-3-large',
+    });
+  });
+
+  it('--format=json reports shape "toml" and a snippet matching the structured fields', async () => {
+    const report = await runJson('codex');
+    expect(report.client).toBe('codex');
+    expect(report.shape).toBe('toml');
+    expect(report.placeholders).toEqual(['OPENAI_API_KEY']);
+    const server = codexServer(report.snippet);
+    expect(server.command).toBe(report.command);
+    expect(server.args).toEqual(report.args);
+    expect(server.env).toEqual(report.env);
+  });
+
+  it('round-trips a root with backslashes, quotes and control characters', async () => {
+    // A Windows-style path segment plus every character TOML forces us to escape.
+    const nasty = path.join(tempDir, 'C:\\Users\\me "quoted"\\kb\ttab\u0001\u007f\\\\end');
+    process.env.KNOWLEDGE_BASES_ROOT_DIR = nasty;
+    const report = await runJson('codex');
+    expect(report.env.KNOWLEDGE_BASES_ROOT_DIR).toBe(nasty);
+    expect(codexServer(report.snippet).env.KNOWLEDGE_BASES_ROOT_DIR).toBe(nasty);
+  });
+
+  it('round-trips an absolute --command=global bin path containing backslashes', async () => {
+    const bin = 'C:\\Program Files\\nodejs\\knowledge-base-mcp-server.cmd';
+    stdout = '';
+    expect(await runConfigClient(['codex', '--format=json', '--command=global'], {
+      ...NO_ACTIVE,
+      resolveServerBin: () => bin,
+    })).toBe(0);
+    const server = codexServer((JSON.parse(stdout) as ConfigClientReport).snippet);
+    expect(server.command).toBe(bin);
+    expect(server.args).toEqual([]);
+  });
+
+  it('tomlString escapes exactly what TOML requires', () => {
+    expect(tomlString('plain /path')).toBe('"plain /path"');
+    expect(tomlString('a"b\\c')).toBe('"a\\"b\\\\c"');
+    expect(tomlString('\b\t\n\f\r')).toBe('"\\b\\t\\n\\f\\r"');
+    expect(tomlString('\u0000\u001f\u007f')).toBe('"\\u0000\\u001F\\u007F"');
+    expect(tomlString('é 日本')).toBe('"é 日本"');
+  });
+
+  it('the test parser rejects invalid TOML (guards against a vacuous round-trip)', () => {
+    expect(() => parseToml('a = "x\\qy"')).toThrow('invalid escape');
+    expect(() => parseToml('a = "x\u0001"')).toThrow('raw control');
+    expect(() => parseToml('a = "x')).toThrow('unterminated');
+    expect(() => parseToml('a = "x" junk')).toThrow('unexpected');
+    expect(() => parseToml('a = "x"\na = "y"')).toThrow('duplicate');
   });
 });
 
@@ -448,5 +638,161 @@ describe('kb config client (spawned CLI)', () => {
     );
     expect(result.status).toBe(2);
     expect(result.stderr).toContain('supported clients:');
+  });
+});
+
+// Decoders written from the vendor docs, independent of the builders, so a
+// builder bug cannot pass by sharing it with the test.
+function decodeCursorLink(link: string): { name: string | null; server: unknown } {
+  const url = new URL(link);
+  expect(`${url.protocol}//${url.host}${url.pathname}`).toBe('cursor://anysphere.cursor-deeplink/mcp/install');
+  const config = url.searchParams.get('config');
+  if (config === null) throw new Error(`no config parameter in ${link}`);
+  return { name: url.searchParams.get('name'), server: JSON.parse(Buffer.from(config, 'base64').toString('utf8')) };
+}
+
+function decodeVscodeUrl(link: string): unknown {
+  const prefix = 'vscode:mcp/install?';
+  expect(link.startsWith(prefix)).toBe(true);
+  return JSON.parse(decodeURIComponent(link.slice(prefix.length)));
+}
+
+function decodeVscodeRedirect(link: string): string {
+  const url = new URL(link);
+  expect(`${url.origin}${url.pathname}`).toBe('https://vscode.dev/redirect');
+  const inner = url.searchParams.get('url');
+  if (inner === null) throw new Error(`no url parameter in ${link}`);
+  return inner;
+}
+
+async function runLink(client: string, ...extra: string[]): Promise<{ code: number; lines: string[] }> {
+  stdout = '';
+  stderr = '';
+  const code = await run([client, '--format=link', ...extra]);
+  return { code, lines: stdout.split('\n').filter((line) => line !== '') };
+}
+
+describe('kb config client --format=link', () => {
+  it('cursor: the config parameter decodes to the server entry --format=json reports', async () => {
+    process.env.EMBEDDING_PROVIDER = 'ollama';
+    const report = await runJson('cursor');
+    const { code, lines } = await runLink('cursor');
+    expect({ code, stderr, count: lines.length }).toEqual({ code: 0, stderr: '', count: 1 });
+    expect(report.placeholders).toEqual([]);
+    expect(decodeCursorLink(lines[0])).toEqual({
+      name: 'knowledge-base',
+      server: { command: report.command, args: report.args, env: report.env },
+    });
+  });
+
+  it('vscode: prints the vscode: URL, then its vscode.dev wrapper; both decode to the entry plus name', async () => {
+    process.env.EMBEDDING_PROVIDER = 'ollama';
+    const report = await runJson('vscode');
+    const { code, lines } = await runLink('vscode');
+    expect({ code, stderr, count: lines.length }).toEqual({ code: 0, stderr: '', count: 2 });
+    const expected = { name: 'knowledge-base', command: report.command, args: report.args, env: report.env };
+    expect(decodeVscodeUrl(lines[0])).toEqual(expected);
+    expect(decodeVscodeRedirect(lines[1])).toBe(lines[0]);
+  });
+
+  it('carries the --command=global bin path', async () => {
+    process.env.EMBEDDING_PROVIDER = 'ollama';
+    const bin = path.join(tempDir, 'bin dir', 'knowledge-base-mcp-server');
+    stdout = '';
+    expect(await runConfigClient(['cursor', '--format=link', '--command=global'], {
+      ...NO_ACTIVE, resolveServerBin: () => bin,
+    })).toBe(0);
+    expect(decodeCursorLink(stdout.trim()).server).toMatchObject({ command: bin, args: [] });
+  });
+
+  it.each(['openai', 'huggingface'])('provider %s: the key is left out of both links and named on stderr', async (provider) => {
+    Object.assign(process.env, SECRETS, { EMBEDDING_PROVIDER: provider });
+    const keyVar = provider === 'openai' ? 'OPENAI_API_KEY' : 'HUGGINGFACE_API_KEY';
+    const report = await runJson('cursor');
+    const expectedEnv = { ...report.env };
+    delete expectedEnv[keyVar];
+
+    const cursor = await runLink('cursor');
+    expect(cursor.code).toBe(0);
+    expect(stderr).toContain(keyVar);
+    const cursorServer = decodeCursorLink(cursor.lines[0]).server as { env: Record<string, string> };
+    expect(cursorServer.env).toEqual(expectedEnv);
+
+    const vscode = await runLink('vscode');
+    expect(vscode.code).toBe(0);
+    expect(stderr).toContain(keyVar);
+    const decoded = [
+      JSON.stringify(cursorServer),
+      JSON.stringify(decodeVscodeUrl(vscode.lines[0])),
+      JSON.stringify(decodeVscodeUrl(decodeVscodeRedirect(vscode.lines[1]))),
+    ];
+    for (const text of [...decoded, stdout]) {
+      expect(text).not.toContain(keyVar);
+      expect(text).not.toContain('MCP_AUTH_TOKEN');
+      for (const secret of Object.values(SECRETS)) expect(text).not.toContain(secret);
+    }
+  });
+
+  it('leaves a credential-bearing URL out of the link too', async () => {
+    Object.assign(process.env, { EMBEDDING_PROVIDER: 'openai', OPENAI_BASE_URL: 'https://user:pw@proxy.example/v1' });
+    const { code, lines } = await runLink('cursor');
+    expect(code).toBe(0);
+    expect(stderr).toContain('OPENAI_BASE_URL');
+    expect((decodeCursorLink(lines[0]).server as { env: object }).env).not.toHaveProperty('OPENAI_BASE_URL');
+    expect(stdout).not.toContain('proxy.example');
+  });
+
+  it.each(SUPPORTED_CLIENTS.filter((c) => !(LINK_CLIENTS as readonly string[]).includes(c)))(
+    '%s: exits 2 and names the supported clients',
+    async (client) => {
+      const { code } = await runLink(client);
+      expect(code).toBe(2);
+      expect(stdout).toBe('');
+      expect(stderr).toContain('--format=link');
+      expect(stderr).toContain('supported clients: cursor, vscode');
+    },
+  );
+
+  it('accepts --format=link before the client name', () => {
+    expect(parseConfigClientArgs(['--format=link', 'vscode']).format).toBe('link');
+    expect(() => parseConfigClientArgs(['--format=link', 'codex'])).toThrow('supported clients: cursor, vscode');
+  });
+
+  it('cursor link survives base64 "+", "/" and "=" through a URL parser', () => {
+    const seen = new Set<string>();
+    for (const value of ['>>>', '>>>>', '>>>>>', '???', '????', '?????', 'a', 'ab']) {
+      const server = { command: 'npx', args: [value], env: {} };
+      for (const ch of Buffer.from(JSON.stringify(server)).toString('base64')) seen.add(ch);
+      expect(decodeCursorLink(cursorInstallLink(server)).server).toEqual(server);
+    }
+    // Guards against a vacuous loop: the inputs did exercise every risky character.
+    for (const ch of ['+', '/', '=']) expect(seen).toContain(ch);
+  });
+
+  it('the README button and the docs/clients.md Cursor link match the generator', async () => {
+    const readme = await fsp.readFile(path.join(ORIGINAL_CWD, 'README.md'), 'utf-8');
+    const clientsDoc = await fsp.readFile(path.join(ORIGINAL_CWD, 'docs', 'clients.md'), 'utf-8');
+    const vscodeButton = vscodeRedirectLink(vscodeInstallUrl(DOCS_LINK_SERVER));
+    expect(readme).toContain(`[![Install in VS Code]`);
+    expect(readme).toContain(`](${vscodeButton})`);
+    expect(clientsDoc).toContain(`\n${cursorInstallLink(DOCS_LINK_SERVER)}\n`);
+    // Every install link committed in either doc must be the generated one.
+    const committed = [...`${readme}\n${clientsDoc}`.matchAll(/(?:https:\/\/vscode\.dev\/redirect\?url=|cursor:\/\/anysphere\.cursor-deeplink\/)[^\s)`]+/g)]
+      .map((m) => m[0]);
+    expect(committed.length).toBeGreaterThanOrEqual(2);
+    for (const link of committed) expect([vscodeButton, cursorInstallLink(DOCS_LINK_SERVER)]).toContain(link);
+    expect(DOCS_LINK_SERVER.env).toEqual({ EMBEDDING_PROVIDER: 'ollama' });
+  });
+
+  it('passes the spawned CLI typo guard', () => {
+    const result = spawnSync(
+      process.execPath,
+      ['--enable-source-maps', '--import', tsxLoaderPath, path.join(ORIGINAL_CWD, 'src', 'cli.ts'),
+        'config', 'client', 'vscode', '--format=link'],
+      { cwd: tempDir, encoding: 'utf-8', env: { ...process.env, EMBEDDING_PROVIDER: 'ollama' } },
+    );
+    expect(result.stderr).not.toMatch(/unknown flag|Did you mean/);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toMatch(/^vscode:mcp\/install\?.*\nhttps:\/\/vscode\.dev\/redirect\?url=/);
   });
 });
