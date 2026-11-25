@@ -9,7 +9,10 @@ Status: **analysis only — no code changed.** Proposals below are
 candidates for RFCs, not commitments.
 
 Updated 2026-11-25 after upstream landed issue #1228 — see
-"Status after upstream #1235" below.
+"Status after upstream #1235" below. Since promoted:
+mutation-path fix → **RFC 022** (docs/rfcs/022-async-mutation-writes.md,
+upstream issue #1315); frontmatter amplifier → **RFC 023**
+(docs/rfcs/023-semantic-content-hash.md, upstream issue #1316).
 
 ## The incident
 
